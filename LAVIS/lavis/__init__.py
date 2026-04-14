@@ -12,10 +12,22 @@ from omegaconf import OmegaConf
 
 from lavis.common.registry import registry
 
-from lavis.datasets.builders import *
-from lavis.models import *
-from lavis.processors import *
-from lavis.tasks import *
+try:
+    from lavis.datasets.builders import *
+except ImportError:
+    pass
+try:
+    from lavis.models import *
+except ImportError:
+    pass
+try:
+    from lavis.processors import *
+except ImportError:
+    pass
+try:
+    from lavis.tasks import *
+except ImportError:
+    pass
 
 
 root_dir = os.path.dirname(os.path.abspath(__file__))

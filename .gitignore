@@ -160,3 +160,8 @@ tmux_result/
 tuned_checkpoint/
 
 cache/
+
+
+
+LAVIS/eval_results/
+LLaVA-CC3M-Pretrain-595K/

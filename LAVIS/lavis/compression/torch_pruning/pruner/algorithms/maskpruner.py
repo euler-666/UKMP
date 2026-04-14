@@ -217,8 +217,13 @@ class MaskPruner(MetaPruner):
         # 2. Thresholding by concatenating all importance scores
         ##############################################
         # Find the threshold for global pruning
+        if len(global_importance) == 0:
+            return
         concat_imp = torch.cat([local_imp[-1][~torch.isinf(local_imp[-1])] for local_imp in global_importance], dim=0)
-        topk_imp, _ = torch.topk(concat_imp, k=self.channel_per_step, largest=False)
+        k = min(self.channel_per_step, len(concat_imp))
+        if k == 0:
+            return
+        topk_imp, _ = torch.topk(concat_imp, k=k, largest=False)
         thres = topk_imp[-1]
         
         ##############################################
