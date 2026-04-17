@@ -169,8 +169,8 @@ def load_pruned_model(model_name, pruned_ckpt_dir, device, dtype=torch.bfloat16)
 # Dataset
 # ---------------------------------------------------------------------------
 class FinetuneDataset(Dataset):
-    def __init__(self, data_path, image_root, tokenizer, max_samples=None,
-                 image_size=448, max_num_tiles=1, max_length=512):
+    def __init__(self, data_path, image_root, max_samples=None,
+                 image_size=448, max_num_tiles=1):
         with open(data_path, "r") as f:
             raw = json.load(f)
         if max_samples is not None:
@@ -180,8 +180,6 @@ class FinetuneDataset(Dataset):
         self.image_root = image_root
         self.image_size = image_size
         self.max_num_tiles = max_num_tiles
-        self.tokenizer = tokenizer
-        self.max_length = max_length
 
     def __len__(self):
         return len(self.data)
@@ -364,7 +362,6 @@ def main(args):
     dataset = FinetuneDataset(
         data_path=args.data_path,
         image_root=args.image_root,
-        tokenizer=tokenizer,
         max_samples=args.max_samples,
         max_num_tiles=1,
     )
@@ -459,7 +456,7 @@ def main(args):
         logger.log(f"Epoch {epoch+1} complete. Avg loss: {avg_epoch_loss:.4f}")
 
     # ------------------------------------------------------------------
-    # 8. Merge LoRA and save
+    # 9. Merge LoRA and save
     # ------------------------------------------------------------------
     logger.log("Merging LoRA weights into base model...")
     model = model.merge_and_unload()
@@ -513,3 +510,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     main(args)
+    

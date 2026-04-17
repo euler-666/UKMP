@@ -12,19 +12,14 @@ from omegaconf import OmegaConf
 
 from lavis.common.registry import registry
 
+# Wildcard imports for LAVIS registry (BLIP-2 models, datasets, etc.).
+# Wrapped in try/except because newer transformers versions removed APIs
+# that some LAVIS model definitions depend on (e.g. apply_chunking_to_forward).
+# The InternVL pruning pipeline does not require these imports.
 try:
     from lavis.datasets.builders import *
-except ImportError:
-    pass
-try:
     from lavis.models import *
-except ImportError:
-    pass
-try:
     from lavis.processors import *
-except ImportError:
-    pass
-try:
     from lavis.tasks import *
 except ImportError:
     pass

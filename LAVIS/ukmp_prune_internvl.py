@@ -32,7 +32,6 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from PIL import Image
 import torchvision.transforms as T
 from torchvision.transforms.functional import InterpolationMode
-import math
 
 NUM_VIT_LAYERS = 24
 NUM_LLM_LAYERS = 28
@@ -101,22 +100,11 @@ def dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbna
     return processed_images
 
 
-def load_image(image_file, input_size=448, max_num=12):
-    image = Image.open(image_file).convert("RGB")
+def load_image_pil(image, input_size=448, max_num=1):
+    """Load pixel values from a PIL Image with optional multi-tile preprocessing."""
     transform = build_transform(input_size=input_size)
     images = dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
-    pixel_values = [transform(img) for img in images]
-    pixel_values = torch.stack(pixel_values)
-    return pixel_values
-
-
-def load_image_from_pil(image, input_size=448, max_num=1):
-    """Load from a PIL Image directly. Use max_num=1 for calibration (single tile)."""
-    transform = build_transform(input_size=input_size)
-    images = dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
-    pixel_values = [transform(img) for img in images]
-    pixel_values = torch.stack(pixel_values)
-    return pixel_values
+    return torch.stack([transform(img) for img in images])
 
 
 def set_random_seed(seed):
@@ -260,7 +248,7 @@ class CalibrationDataset(Dataset):
 
         try:
             image = Image.open(img_path).convert("RGB")
-            pixel_values = load_image_from_pil(image, input_size=self.image_size, max_num=1)
+            pixel_values = load_image_pil(image, input_size=self.image_size, max_num=1)
         except Exception:
             pixel_values = torch.zeros(1, 3, self.image_size, self.image_size)
 

@@ -78,18 +78,20 @@ class BaseMaskPruningFunc(ABC):
 
     def _prune_parameter_and_grad(self, weight, idxs, pruning_dim):
         mask = weight.preserve_masks[pruning_dim]
-        max_idx = max(idxs) if len(idxs) > 0 else -1
-        if max_idx >= len(mask):
-            name = getattr(weight, 'global_name', 'unknown')
-            raise IndexError(
-                f"Pruning index {max_idx} out of range for mask dim {pruning_dim} "
-                f"(size={len(mask)}) on parameter '{name}' "
-                f"with shape {list(weight.shape)}. "
-                f"Requested idxs range: [{min(idxs)}, {max_idx}]"
-            )
+        if idxs:
+            hi = max(idxs)
+            if hi >= len(mask):
+                name = getattr(weight, "global_name", "unknown")
+                lo = min(idxs)
+                raise IndexError(
+                    f"Pruning index {hi} out of range for mask dim {pruning_dim} "
+                    f"(size={len(mask)}) on parameter '{name}' "
+                    f"with shape {list(weight.shape)}. "
+                    f"Requested idxs range: [{lo}, {hi}]"
+                )
         mask[idxs] = 0
         return
-    
+
     def _compress_parameter(self, weight, keep_idxs, pruning_dim):
         pruned_weight = torch.nn.Parameter(torch.index_select(weight, pruning_dim, keep_idxs))
         if hasattr(weight, 'global_name'):

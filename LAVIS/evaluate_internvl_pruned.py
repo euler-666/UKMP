@@ -9,7 +9,6 @@ import json
 import logging
 import os
 import random
-from functools import partial
 
 import numpy as np
 import torch
@@ -34,17 +33,6 @@ def setup_seeds(seed):
     torch.cuda.manual_seed_all(seed)
     cudnn.benchmark = False
     cudnn.deterministic = True
-
-
-def get_module_by_name(model, name):
-    parts = name.split(".")
-    module = model
-    for part in parts:
-        if hasattr(module, part):
-            module = getattr(module, part)
-        else:
-            return None
-    return module
 
 
 # ---------------------------------------------------------------------------
@@ -379,10 +367,6 @@ if __name__ == "__main__":
                         help="HuggingFace model name (for tokenizer and optionally full model)")
     parser.add_argument("--pruned_ckpt", type=str, default=None,
                         help="Path to pruned model checkpoint (.bin)")
-    parser.add_argument("--peft_ckpt", type=str, default=None,
-                        help="Path to PEFT/LoRA checkpoint directory")
-    parser.add_argument("--pruned_mask", type=str, default=None,
-                        help="Path to prune_masks.json (for PruneLoRA weight recalling)")
     parser.add_argument("--job_id", type=str, default="eval",
                         help="Job ID for output naming")
     parser.add_argument("--device", type=str, default="cuda", help="Device")

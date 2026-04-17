@@ -5,16 +5,15 @@
 from omegaconf import OmegaConf
 
 __all__ = []
-
+# BLIP-2 specific pruners. Optional -- not needed for InternVL pruning.
+# May fail on newer transformers versions that removed legacy APIs.
 try:
     from lavis.compression.pruners.base_pruner import BasePruner
-
     from lavis.compression.pruners.global_pruner import (
         BLIPT5GlobalMagPruner,
         BLIPT5GlobalGradMagAbsPruner,
         BLIPT5GlobalMeZoPruner,
     )
-
     from lavis.compression.pruners.wanda_pruner import (
         T5LayerWandaPruner, VITLayerWandaPruner, BLIPT5LayerWandaPruner
     )
@@ -22,7 +21,6 @@ try:
         T5LayerSparseGPTPruner, VITLayerSparseGPTPruner, BLIPT5LayerSparseGPTPruner
     )
     from lavis.common.registry import registry
-
     __all__ = ["BasePruner"]
 except ImportError:
     registry = None
