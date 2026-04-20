@@ -194,13 +194,24 @@ def selected_causal_lm_forward(original_forward, self, *args, **kwargs):
     shift_logits = logits[..., :-1, :].contiguous()
     shift_labels = labels[..., 1:].contiguous()
 
+    # Only consider answer token positions (where labels != -100)
+    # for threshold computation, matching T5's decoder-only behavior.
+    valid_mask = shift_labels != -100
     sm_p = F.softmax(shift_logits, dim=-1)
     max_values, _ = torch.max(sm_p, dim=-1)
 
-    thresh = max(0.4, torch.min(max_values).item())
-    indices = (max_values <= thresh).nonzero(as_tuple=True)
+    valid_max = max_values[valid_mask]
+    if valid_max.numel() == 0:
+        return outputs
+    thresh = max(0.4, torch.min(valid_max).item())
+
+    select_mask = (max_values <= thresh) & valid_mask
+    indices = select_mask.nonzero(as_tuple=True)
     selected_logits = shift_logits[indices[0], indices[1], :]
     selected_labels = shift_labels[indices[0], indices[1]]
+
+    if selected_logits.numel() == 0:
+        return outputs
 
     loss_fct = CrossEntropyLoss(ignore_index=-100, reduction="mean")
     loss = loss_fct(
@@ -253,15 +264,22 @@ class CalibrationDataset(Dataset):
             pixel_values = torch.zeros(1, 3, self.image_size, self.image_size)
 
         if "conversations" in item:
-            text_parts = []
+            question_parts = []
+            answer_parts = []
             for turn in item["conversations"]:
                 val = turn.get("value", turn.get("content", ""))
-                text_parts.append(val.replace("<image>", "").strip())
-            text = " ".join(text_parts)
+                val = val.replace("<image>", "").strip()
+                if turn.get("from") == "human":
+                    question_parts.append(val)
+                else:
+                    answer_parts.append(val)
+            question = " ".join(question_parts) if question_parts else "Describe this image."
+            text = " ".join(answer_parts) if answer_parts else "Describe this image."
         else:
-            text = item.get("caption", item.get("text", "Describe this image."))
+            question = "Describe this image."
+            text = item.get("caption", item.get("text", ""))
 
-        return {"pixel_values": pixel_values, "text": text}
+        return {"pixel_values": pixel_values, "text": text, "question": question}
 
 
 def build_calibration_loader(args, tokenizer, model):
@@ -289,7 +307,7 @@ def build_calibration_loader(args, tokenizer, model):
 
 
 def prepare_internvl_inputs(samples, model, tokenizer, device):
-    """Convert a list of {pixel_values, text} dicts into model-ready inputs with labels."""
+    """Convert a list of {pixel_values, text, question} dicts into model-ready inputs with labels."""
     pixel_values_list = []
     input_ids_list = []
     labels_list = []
@@ -302,6 +320,7 @@ def prepare_internvl_inputs(samples, model, tokenizer, device):
     for sample in samples:
         pv = sample["pixel_values"]
         text = sample["text"]
+        user_question = sample.get("question", "Describe this image.")
 
         pixel_values_list.append(pv)
         num_patches = pv.shape[0]
@@ -309,7 +328,7 @@ def prepare_internvl_inputs(samples, model, tokenizer, device):
 
         num_image_tokens = model.num_image_token * num_patches
         image_tokens = IMG_CONTEXT_TOKEN * num_image_tokens
-        question = f"<img>{image_tokens}</img>\nDescribe this image."
+        question = f"<img>{image_tokens}</img>\n{user_question}"
 
         prompt = (
             f"<|im_start|>user\n{question}<|im_end|>\n"
@@ -320,7 +339,20 @@ def prepare_internvl_inputs(samples, model, tokenizer, device):
                               max_length=512, padding="max_length")
         input_ids = tokenized["input_ids"].squeeze(0)
 
+        # Mask labels: only the assistant response tokens should contribute to loss.
+        # Everything before (and including) "<|im_start|>assistant\n" gets -100.
+        assistant_marker = "<|im_start|>assistant\n"
+        assistant_ids = tokenizer.encode(assistant_marker, add_special_tokens=False)
+        marker_len = len(assistant_ids)
+        ids_list = input_ids.tolist()
+        ans_start = len(ids_list)
+        for j in range(len(ids_list) - marker_len + 1):
+            if ids_list[j:j + marker_len] == assistant_ids:
+                ans_start = j + marker_len
+                break
+
         labels = input_ids.clone()
+        labels[:ans_start] = -100
         labels[labels == tokenizer.pad_token_id] = -100
 
         input_ids_list.append(input_ids)
@@ -635,14 +667,9 @@ def main(args):
     )
 
     # ------------------------------------------------------------------
-    # 9. Selected loss (optional)
-    # ------------------------------------------------------------------
-    if args.select_loss:
-        original_forward = model.forward
-        model.forward = partial(selected_causal_lm_forward, original_forward, model)
-
-    # ------------------------------------------------------------------
-    # 10. Knowledge importance via entropy (optional)
+    # 9. Knowledge importance via entropy (optional)
+    # Note: must run BEFORE select_loss monkey-patch to avoid OOM —
+    # the entropy pass only needs hook activations, not the loss.
     # ------------------------------------------------------------------
     if args.entropy_importance:
 
@@ -669,18 +696,31 @@ def main(args):
 
         pruner.process_imp_list = partial(new_process_imp_list, pruner)
 
+        answer_start_idx = [0]
+
         def forward_projection_save_hook(module, input, output):
             weights = module.weight.t()
             x_flat = input[0].view(-1, input[0].size(-1))
+            ans_start = answer_start_idx[0]
+            if ans_start > 0 and ans_start < x_flat.shape[0]:
+                x_flat = x_flat[ans_start:]
             weights_norm = F.normalize(weights, p=2, dim=0)
             x_norm = F.normalize(x_flat, p=2, dim=1)
             sim = torch.matmul(x_norm, weights_norm)
-            module.out_dim_vals.append(sim)
+            module.out_dim_vals.append(sim.cpu())
 
         logger.log("Computing knowledge importance (entropy)...")
         with torch.no_grad():
-            # Hook into Qwen3 attention + MLP projection layers
             module_name_filters = [".q_proj", ".k_proj", ".v_proj", "gate_proj", "up_proj"]
+
+            real_lm_head = model.language_model.lm_head
+            model.language_model.lm_head = nn.Identity()
+
+            assistant_token_ids = tokenizer.encode(
+                "<|im_start|>assistant\n", add_special_tokens=False
+            )
+            assistant_len = len(assistant_token_ids)
+
             module_list, hook_list = [], []
             for name, module in model.language_model.named_modules():
                 if not isinstance(module, nn.Linear):
@@ -694,30 +734,51 @@ def main(args):
                         )
                         break
 
+            num_batches = min(args.num_examples // args.calibration_bs, len(data_loader))
+            logger.log(f"  {len(module_list)} modules hooked, {num_batches} batches...")
             loader_iter = iter(data_loader)
-            for i in range(min(args.num_examples // args.calibration_bs, len(data_loader))):
+            for i in range(num_batches):
                 batch_samples = next(loader_iter)
                 inputs = prepare_internvl_inputs(
                     batch_samples, model, tokenizer, args.device
                 )
+                inputs.pop("labels", None)
+
+                ids = inputs["input_ids"][0].tolist()
+                ans_pos = 0
+                for j in range(len(ids) - assistant_len + 1):
+                    if ids[j:j + assistant_len] == assistant_token_ids:
+                        ans_pos = j + assistant_len
+                answer_start_idx[0] = ans_pos
+
                 model(**inputs)
+                if (i + 1) % 50 == 0 or i == num_batches - 1:
+                    logger.log(f"    [{i + 1}/{num_batches}]")
 
             for module in module_list:
-                out_dim_vals = torch.cat(module.out_dim_vals, dim=0).to(torch.float)
+                out_dim_vals = torch.cat(module.out_dim_vals, dim=0).float().to(args.device)
                 entropies = []
                 for d in range(out_dim_vals.shape[-1]):
                     hist = torch.histc(out_dim_vals[:, d], bins=100, min=-1, max=1)
                     prob = hist / hist.sum(dim=0, keepdim=True)
                     entropy = -torch.sum(prob * torch.log(prob + 1e-12), dim=0)
                     entropies.append(entropy)
-                entropies = torch.stack(entropies)
-                module.out_dim_entropy = entropies
+                module.out_dim_entropy = torch.stack(entropies)
                 del out_dim_vals, module.out_dim_vals
                 torch.cuda.empty_cache()
             for hook_handle in hook_list:
                 hook_handle.remove()
             torch.cuda.empty_cache()
+
+            model.language_model.lm_head = real_lm_head
         torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # 10. Selected loss (optional) — applied after entropy computation
+    # ------------------------------------------------------------------
+    if args.select_loss:
+        original_forward = model.forward
+        model.forward = partial(selected_causal_lm_forward, original_forward, model)
 
     # ------------------------------------------------------------------
     # 11. Compute gradient-based importance
