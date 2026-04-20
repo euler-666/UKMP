@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import random
+from functools import partial
 
 import numpy as np
 import torch
@@ -24,6 +25,56 @@ from torchvision.transforms.functional import InterpolationMode
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+NUM_VIT_LAYERS = 24
+NUM_LLM_LAYERS = 28
+
+
+def _decoupled_internvit_attn_forward(self, x):
+    """Replacement forward for InternAttention after decoupling fused qkv."""
+    B, N, C = x.shape
+    q = self.q(x).reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)
+    k = self.k(x).reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)
+    v = self.v(x).reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)
+
+    head_dim = q.shape[-1]
+    scale = head_dim ** -0.5
+    attn = (q * scale) @ k.transpose(-2, -1)
+    attn = attn.softmax(dim=-1)
+    attn = self.attn_drop(attn)
+
+    x = (attn @ v).transpose(1, 2).reshape(B, N, -1)
+    x = self.proj(x)
+    x = self.proj_drop(x)
+    return x
+
+
+def decouple_internvit_qkv(model, device="cpu"):
+    """Split fused qkv linear in each InternViT attention layer into q, k, v."""
+    for name, module in model.vision_model.encoder.layers.named_modules():
+        if hasattr(module, "qkv") and isinstance(module.qkv, nn.Linear):
+            qkv = module.qkv
+            in_feat = qkv.in_features
+            out_feat = qkv.out_features // 3
+            has_bias = qkv.bias is not None
+
+            q = nn.Linear(in_feat, out_feat, bias=has_bias, device=device)
+            k = nn.Linear(in_feat, out_feat, bias=has_bias, device=device)
+            v = nn.Linear(in_feat, out_feat, bias=has_bias, device=device)
+
+            q.weight.data = qkv.weight.data[:out_feat, :]
+            k.weight.data = qkv.weight.data[out_feat : out_feat * 2, :]
+            v.weight.data = qkv.weight.data[out_feat * 2 :, :]
+            if has_bias:
+                q.bias.data = qkv.bias.data[:out_feat]
+                k.bias.data = qkv.bias.data[out_feat : out_feat * 2]
+                v.bias.data = qkv.bias.data[out_feat * 2 :]
+
+            module.q = q
+            module.k = k
+            module.v = v
+            del module.qkv
+            module.forward = partial(_decoupled_internvit_attn_forward, module)
 
 
 def setup_seeds(seed):
@@ -266,6 +317,8 @@ def main(args):
             low_cpu_mem_usage=True,
         )
 
+        decouple_internvit_qkv(model, device="cpu")
+
         if shapes_path and os.path.exists(shapes_path):
             with open(shapes_path) as f:
                 shape_map = {k: tuple(v) for k, v in json.load(f).items()}
@@ -303,8 +356,28 @@ def main(args):
                 setattr(parent, attr, nn.Parameter(torch.empty(pruned_shape, dtype=param.dtype)))
 
         state_dict = torch.load(sd_path, map_location="cpu", weights_only=True)
-        model.load_state_dict(state_dict, strict=False)
+        model.load_state_dict(state_dict, strict=True)
         del state_dict
+
+        vit_config = model.vision_model.config
+        orig_vit_head_dim = vit_config.hidden_size // vit_config.num_attention_heads
+        for i in range(NUM_VIT_LAYERS):
+            attn = model.vision_model.encoder.layers[i].attn
+            if hasattr(attn, "q") and orig_vit_head_dim > 0:
+                attn.num_heads = attn.q.weight.shape[0] // orig_vit_head_dim
+
+        for i in range(NUM_LLM_LAYERS):
+            attn = model.language_model.model.layers[i].self_attn
+            head_dim = attn.head_dim
+            if head_dim > 0:
+                new_num_heads = attn.q_proj.weight.shape[0] // head_dim
+                new_num_kv_heads = attn.k_proj.weight.shape[0] // head_dim
+                attn.num_heads = new_num_heads
+                attn.num_key_value_heads = new_num_kv_heads
+                if hasattr(attn, "config"):
+                    attn.config.num_attention_heads = new_num_heads
+                    attn.config.num_key_value_heads = new_num_kv_heads
+
         logger.info("Pruned model loaded.")
     else:
         logger.info(f"Loading full model: {args.model_name}")

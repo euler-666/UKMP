@@ -2,13 +2,26 @@
 UKMP Recovery Fine-tuning for Pruned InternVL 3.5 1B
 Loads a pruned InternVL checkpoint (state_dict + pruned_shapes.json) and
 fine-tunes with LoRA + optional knowledge distillation from the full model.
+
+Progressive distillation stages (--distill_mode):
+  Stage 0 (τ1): β1 * Lmse(Ev_s, Ev_t)  — align vision hidden states
+  Stage 1 (τ2): β1 * Lmse(Ev_s, Ev_t) + β2 * Lmse(El_s, El_t)
+                — align vision + language hidden states
+  Stage 2 (τ3): Ltask(ys, y) + Lkl(ps, pt)
+                — CE task loss + KL divergence on logits
+
+Weight Recalling (--wr_lora): PruneLora with parallel branches
+  f(X) = (Wr + P1*Q1 + P2*Q2*Wp) * X  (paper Eq. 12)
 """
 
 import argparse
 import json
 import os
+import re
 import random
 import math
+from copy import deepcopy
+from functools import partial
 
 import numpy as np
 import torch
@@ -24,7 +37,69 @@ import torchvision.transforms as T
 from torchvision.transforms.functional import InterpolationMode
 
 from lavis.common.logger import LoggerWithDepth
-from lavis.peft import LoraConfig, get_peft_model
+from lavis.peft import (
+    PruneLoraConfig,
+    LoraConfig,
+    get_peft_model,
+    get_peft_model_state_dict,
+    set_peft_model_state_dict,
+)
+from lavis.peft.tuners.prunelora.layer import Linear as PruneLoraLinear
+
+NUM_VIT_LAYERS = 24
+NUM_LLM_LAYERS = 28
+
+
+# ---------------------------------------------------------------------------
+# InternViT QKV decoupling (fused qkv -> separate q, k, v)
+# Must be done before loading pruned weights since the pruning script saves
+# with decoupled q,k,v keys.
+# ---------------------------------------------------------------------------
+def _decoupled_internvit_attn_forward(self, x):
+    """Replacement forward for InternAttention after decoupling fused qkv."""
+    B, N, C = x.shape
+    q = self.q(x).reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)
+    k = self.k(x).reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)
+    v = self.v(x).reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)
+
+    head_dim = q.shape[-1]
+    scale = head_dim ** -0.5
+    attn = (q * scale) @ k.transpose(-2, -1)
+    attn = attn.softmax(dim=-1)
+    attn = self.attn_drop(attn)
+
+    x = (attn @ v).transpose(1, 2).reshape(B, N, -1)
+    x = self.proj(x)
+    x = self.proj_drop(x)
+    return x
+
+
+def decouple_internvit_qkv(model, device="cpu"):
+    """Split fused qkv linear in each InternViT attention layer into q, k, v."""
+    for name, module in model.vision_model.encoder.layers.named_modules():
+        if hasattr(module, "qkv") and isinstance(module.qkv, nn.Linear):
+            qkv = module.qkv
+            in_feat = qkv.in_features
+            out_feat = qkv.out_features // 3
+            has_bias = qkv.bias is not None
+
+            q = nn.Linear(in_feat, out_feat, bias=has_bias, device=device)
+            k = nn.Linear(in_feat, out_feat, bias=has_bias, device=device)
+            v = nn.Linear(in_feat, out_feat, bias=has_bias, device=device)
+
+            q.weight.data = qkv.weight.data[:out_feat, :]
+            k.weight.data = qkv.weight.data[out_feat : out_feat * 2, :]
+            v.weight.data = qkv.weight.data[out_feat * 2 :, :]
+            if has_bias:
+                q.bias.data = qkv.bias.data[:out_feat]
+                k.bias.data = qkv.bias.data[out_feat : out_feat * 2]
+                v.bias.data = qkv.bias.data[out_feat * 2 :]
+
+            module.q = q
+            module.k = k
+            module.v = v
+            del module.qkv
+            module.forward = partial(_decoupled_internvit_attn_forward, module)
 
 
 def setup_seeds(seed):
@@ -109,10 +184,174 @@ def load_image_pil(image, input_size=448, max_num=1):
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def get_module_by_name(model, name):
+    parts = name.split('.')
+    module = model
+    for part in parts:
+        if hasattr(module, part):
+            module = getattr(module, part)
+        else:
+            return None
+    return module
+
+
+# ---------------------------------------------------------------------------
+# Forward hooks for progressive distillation
+# ---------------------------------------------------------------------------
+def forward_save_feature_hook(module, input, output):
+    """Save block output for MSE distillation. Handles tuple outputs (e.g. LLM layers)."""
+    if isinstance(output, tuple):
+        module.feature = output[0]
+    else:
+        module.feature = output
+
+
+def register_hooks(model, model_label="model"):
+    """Attach feature-saving hooks to all InternViT and Qwen3 layers."""
+    hook_list = []
+
+    for name, module in model.named_modules():
+        m_vit = re.search(r'vision_model\.encoder\.layers\.(\d+)$', name)
+        if m_vit:
+            hook_list.append(module.register_forward_hook(forward_save_feature_hook))
+            continue
+
+        m_llm = re.search(r'language_model\.model\.layers\.(\d+)$', name)
+        if m_llm:
+            hook_list.append(module.register_forward_hook(forward_save_feature_hook))
+
+    return hook_list
+
+
+# ---------------------------------------------------------------------------
+# Progressive distillation loss functions (paper Eq. 13-14)
+# ---------------------------------------------------------------------------
+mse_criterion = nn.MSELoss()
+
+
+def _mse_feat(student_feat, teacher_feat, feature_norm):
+    """Compute MSE between student and teacher features.
+    When feature_norm=True, applies per-layer L2 normalization (paper Eq. 14):
+      || Es,n/||Es,n||_2 - Et,n/||Et,n||_2 ||^2
+    """
+    if student_feat.shape != teacher_feat.shape:
+        teacher_feat = teacher_feat[..., :student_feat.shape[-1]]
+    if feature_norm:
+        student_feat = F.normalize(student_feat.float(), p=2, dim=-1)
+        teacher_feat = F.normalize(teacher_feat.float(), p=2, dim=-1)
+    return mse_criterion(student_feat, teacher_feat)
+
+
+def _enable_vit_grads(inputs):
+    """Ensure pixel_values requires grad so gradient checkpointing in InternViT works."""
+    if inputs["pixel_values"].dtype.is_floating_point:
+        inputs["pixel_values"] = inputs["pixel_values"].detach().requires_grad_(True)
+    return inputs
+
+
+def _get_student_base(student_model):
+    return student_model.model if type(student_model).__name__ == "PeftModel" else student_model
+
+
+def _run_both(student_model, teacher_model, inputs):
+    """Run student (with grads) and teacher (no grads) forward passes."""
+    inputs = _enable_vit_grads(inputs)
+    student_model(**inputs)
+    with torch.no_grad():
+        teacher_model(**inputs)
+
+
+def _vision_mse(student_base, teacher_model, feature_norm, n_layers=NUM_VIT_LAYERS):
+    """Eq. 14 for vision: sum of per-layer normalized MSE over ViT layers."""
+    loss = 0.0
+    for i in range(n_layers):
+        s_layer = student_base.vision_model.encoder.layers[i]
+        t_layer = teacher_model.vision_model.encoder.layers[i]
+        if hasattr(s_layer, 'feature') and hasattr(t_layer, 'feature'):
+            loss += _mse_feat(s_layer.feature, t_layer.feature, feature_norm)
+    return loss
+
+
+def _llm_mse(student_base, teacher_model, feature_norm, n_layers=NUM_LLM_LAYERS):
+    """Eq. 14 for language: sum of per-layer normalized MSE over LLM layers."""
+    loss = 0.0
+    for i in range(n_layers):
+        s_layer = student_base.language_model.model.layers[i]
+        t_layer = teacher_model.language_model.model.layers[i]
+        if hasattr(s_layer, 'feature') and hasattr(t_layer, 'feature'):
+            loss += _mse_feat(s_layer.feature, t_layer.feature, feature_norm)
+    return loss
+
+
+def train_step_tau1(student_model, teacher_model, inputs,
+                    feature_norm=True, beta1=1.0, **_kw):
+    """Phase τ1 (Eq.13): β1 * Lmse(Ev_s, Ev_t) — align vision hidden states."""
+    _run_both(student_model, teacher_model, inputs)
+    student_base = _get_student_base(student_model)
+    return beta1 * _vision_mse(student_base, teacher_model, feature_norm)
+
+
+def train_step_tau2(student_model, teacher_model, inputs,
+                    feature_norm=True, beta1=1.0, beta2=1.0, **_kw):
+    """Phase τ2 (Eq.13): β1*Lmse(Ev_s,Ev_t) + β2*Lmse(El_s,El_t)
+    — align vision + language hidden states."""
+    _run_both(student_model, teacher_model, inputs)
+    student_base = _get_student_base(student_model)
+    v_loss = _vision_mse(student_base, teacher_model, feature_norm)
+    l_loss = _llm_mse(student_base, teacher_model, feature_norm)
+    return beta1 * v_loss + beta2 * l_loss
+
+
+def train_step_tau3(student_model, teacher_model, inputs,
+                    kd_temperature=1.0, **_kw):
+    """Phase τ3 (Eq.13): Ltask(ys, y) + Lkl(ps, pt)
+    — task CE loss + KL divergence on logits."""
+    outputs = student_model(**inputs)
+    loss = outputs.loss
+
+    with torch.no_grad():
+        teacher_outputs = teacher_model(**inputs)
+
+    student_logits = outputs.logits
+    teacher_logits = teacher_outputs.logits
+    min_len = min(student_logits.shape[1], teacher_logits.shape[1])
+
+    T = kd_temperature
+    kl_loss = F.kl_div(
+        F.log_softmax(student_logits[:, :min_len] / T, dim=-1),
+        F.softmax(teacher_logits[:, :min_len] / T, dim=-1),
+        reduction="batchmean",
+    ) * (T ** 2)
+
+    return loss + kl_loss
+
+
+def _compute_data_slices(total_samples):
+    """Split dataset into 3 phases following the paper:
+      τ1 (visual MSE):         ~6.7% of data  (40K/595K in the paper)
+      τ2 (visual + LLM MSE):  ~47.1% of data  (280K/595K in the paper)
+      τ3 (CE + KL):           ~46.2% of data  (275K/595K in the paper)
+    """
+    t1_end = round(total_samples * 40 / 595)
+    t2_end = t1_end + round(total_samples * 280 / 595)
+    return [
+        (0, t1_end),
+        (t1_end, t2_end),
+        (t2_end, total_samples),
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Model loading helper (state_dict + pruned_shapes.json)
 # ---------------------------------------------------------------------------
 def load_pruned_model(model_name, pruned_ckpt_dir, device, dtype=torch.bfloat16):
-    """Load a pruned model from state_dict + pruned_shapes.json."""
+    """Load a pruned model from state_dict + pruned_shapes.json.
+
+    The pruning script decouples InternViT's fused qkv into separate q,k,v
+    before pruning, so we must do the same here before loading the state dict.
+    """
     sd_path = os.path.join(pruned_ckpt_dir, "model.pt")
     shapes_path = os.path.join(pruned_ckpt_dir, "pruned_shapes.json")
 
@@ -123,6 +362,9 @@ def load_pruned_model(model_name, pruned_ckpt_dir, device, dtype=torch.bfloat16)
         use_flash_attn=False,
         low_cpu_mem_usage=True,
     )
+
+    # Decouple fused qkv -> q, k, v so that pruned state dict keys match
+    decouple_internvit_qkv(model, device="cpu")
 
     if os.path.exists(shapes_path):
         with open(shapes_path) as f:
@@ -160,8 +402,31 @@ def load_pruned_model(model_name, pruned_ckpt_dir, device, dtype=torch.bfloat16)
             setattr(parent, attr, nn.Parameter(torch.empty(pruned_shape, dtype=param.dtype)))
 
     state_dict = torch.load(sd_path, map_location="cpu", weights_only=True)
-    model.load_state_dict(state_dict, strict=False)
+    model.load_state_dict(state_dict, strict=True)
     del state_dict
+
+    # Post-load fixup: update attention head counts to match pruned dimensions.
+    # Use original head_dim (before pruning) since prune_num_heads=True keeps
+    # head_dim constant and only removes entire heads.
+    vit_config = model.vision_model.config
+    orig_vit_head_dim = vit_config.hidden_size // vit_config.num_attention_heads
+    for i in range(NUM_VIT_LAYERS):
+        attn = model.vision_model.encoder.layers[i].attn
+        if hasattr(attn, "q") and orig_vit_head_dim > 0:
+            attn.num_heads = attn.q.weight.shape[0] // orig_vit_head_dim
+
+    for i in range(NUM_LLM_LAYERS):
+        attn = model.language_model.model.layers[i].self_attn
+        head_dim = attn.head_dim
+        if head_dim > 0:
+            new_num_heads = attn.q_proj.weight.shape[0] // head_dim
+            new_num_kv_heads = attn.k_proj.weight.shape[0] // head_dim
+            attn.num_heads = new_num_heads
+            attn.num_key_value_heads = new_num_kv_heads
+            if hasattr(attn, "config"):
+                attn.config.num_attention_heads = new_num_heads
+                attn.config.num_key_value_heads = new_num_kv_heads
+
     return model
 
 
@@ -316,6 +581,7 @@ def main(args):
     # 2. Load full (teacher) model if distillation is enabled
     # ------------------------------------------------------------------
     full_model = None
+    hook_list = []
     if args.distill_mode:
         logger.log("Loading full InternVL model as teacher...")
         full_model = AutoModel.from_pretrained(
@@ -325,10 +591,18 @@ def main(args):
             use_flash_attn=False,
             low_cpu_mem_usage=True,
         )
+        decouple_internvit_qkv(full_model, device="cpu")
         full_model.to(device)
         full_model.eval()
         for param in full_model.parameters():
             param.requires_grad = False
+
+        logger.log("Registering feature hooks on teacher...")
+        hook_list += register_hooks(full_model, "teacher")
+
+        for name, module in full_model.named_modules():
+            if isinstance(module, nn.Dropout):
+                module.p = 0
 
     # ------------------------------------------------------------------
     # 3. Load pruned (student) model
@@ -340,56 +614,105 @@ def main(args):
         if isinstance(module, nn.Dropout):
             module.p = 0
 
+    if args.distill_mode:
+        if hasattr(model.vision_model, 'gradient_checkpointing_disable'):
+            model.vision_model.gradient_checkpointing_disable()
+        if hasattr(model.vision_model, 'encoder') and hasattr(model.vision_model.encoder, 'gradient_checkpointing'):
+            model.vision_model.encoder.gradient_checkpointing = False
+        logger.log("Disabled gradient checkpointing on student ViT for MSE distillation")
+
     # ------------------------------------------------------------------
-    # 4. Apply LoRA
+    # 4. Load pruned mask and apply PruneLora (Weight Recalling) or plain LoRA
     # ------------------------------------------------------------------
+    pruned_mask = None
+    mask_data = None
+    if args.pruned_mask is not None and os.path.exists(args.pruned_mask):
+        logger.log(f"Loading pruned mask from: {args.pruned_mask}")
+        mask_data = json.load(open(args.pruned_mask, 'r'))
+        pruned_mask = {}
+        for k in mask_data.keys():
+            pruned_mask[k] = [torch.tensor(mask, dtype=torch.bool) for mask in mask_data[k]]
+
     lora_targets = [t.strip() for t in args.lora_target_modules.split(",")]
-    lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        target_modules=lora_targets,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        init_lora_weights=True,
-    )
-    model = get_peft_model(model, lora_config)
-    model.to(device)
+
+    if args.wr_lora and pruned_mask is not None:
+        logger.log("Setting up PruneLora (Weight Recalling) structure...")
+
+        pruned_linear_features = {}
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Linear):
+                key = name + '.weight'
+                if key in mask_data:
+                    pruned_linear_features[name] = [
+                        (len(l) - int(sum(l))) for l in mask_data[key]
+                    ]
+                elif any(name.endswith('.' + t) for t in lora_targets):
+                    pruned_linear_features[name] = [0, 0]
+
+        config = PruneLoraConfig(
+            r=args.lora_r,
+            pruned_r=args.lora_pruned_r,
+            lora_alpha=args.lora_alpha,
+            target_modules=lora_targets,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            init_lora_weights=True,
+            pruned_features=pruned_linear_features,
+        )
+        if not hasattr(model, 'config') or model.config is None:
+            from transformers import PretrainedConfig
+            model.config = PretrainedConfig()
+        model = get_peft_model(model, config).to(device)
+
+        if full_model is None:
+            logger.log("WARNING: --wr_lora requires a teacher model (--distill_mode) "
+                        "to initialize weight recalling branches. Skipping WR init.")
+        for _name, module in model.named_modules():
+            if full_model is None:
+                break
+            if isinstance(module, PruneLoraLinear):
+                name = _name.replace('base_model.model.', '').replace('.base_layer', '')
+                full_module = get_module_by_name(full_model, name)
+                if full_module is None:
+                    continue
+                key = name + '.weight'
+                if key not in pruned_mask:
+                    continue
+                masks = pruned_mask[key]
+                if module.input_base_layer is not None:
+                    module.input_base_layer.weight.data = (
+                        full_module.weight.data[masks[0]][:, ~masks[1]].clone()
+                    )
+                    module.input_base_layer.weight.requires_grad = False
+                if module.output_base_layer is not None:
+                    module.output_base_layer.weight.data = (
+                        full_module.weight.data[~masks[0]][:, masks[1]].clone()
+                    )
+                    module.output_base_layer.weight.requires_grad = False
+    else:
+        logger.log("Setting up standard LoRA...")
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            target_modules=lora_targets,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            init_lora_weights=True,
+        )
+        model = get_peft_model(model, lora_config)
+        model.to(device)
+
     model.print_trainable_parameters()
 
-    # ------------------------------------------------------------------
-    # 5. Build dataset and dataloader
-    # ------------------------------------------------------------------
-    dataset = FinetuneDataset(
-        data_path=args.data_path,
-        image_root=args.image_root,
-        max_samples=args.max_samples,
-        max_num_tiles=1,
-    )
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=2,
-        collate_fn=lambda batch: batch,
-        drop_last=True,
-    )
+    if args.distill_mode:
+        logger.log("Registering feature hooks on student...")
+        hook_list += register_hooks(
+            model.model if type(model).__name__ == "PeftModel" else model,
+            "student",
+        )
 
     # ------------------------------------------------------------------
-    # 6. Optimizer and scheduler
-    # ------------------------------------------------------------------
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
-    total_steps = max(1, len(dataloader) * args.num_epochs // args.gradient_accumulation_steps)
-
-    def cosine_lr(step):
-        if step >= total_steps:
-            return 0.01
-        return 0.01 + 0.5 * (1.0 - 0.01) * (1 + math.cos(math.pi * step / total_steps))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=cosine_lr)
-
-    # ------------------------------------------------------------------
-    # 7. Set img_context_token_id on both student and teacher
+    # 5. Set img_context_token_id on both student and teacher
     # ------------------------------------------------------------------
     IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
     img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
@@ -400,65 +723,131 @@ def main(args):
         full_model.img_context_token_id = img_context_token_id
 
     # ------------------------------------------------------------------
-    # 8. Training loop
+    # 6. Build dataset
     # ------------------------------------------------------------------
-    logger.log(f"Starting fine-tuning: {args.num_epochs} epochs, "
-               f"{len(dataset)} samples, bs={args.batch_size}, "
-               f"grad_accum={args.gradient_accumulation_steps}")
-    global_step = 0
-    optimizer.zero_grad()
-    for epoch in range(args.num_epochs):
-        model.train()
-        epoch_loss = 0.0
-        for batch_idx, batch_samples in enumerate(dataloader):
-            base_model = student_base
+    full_dataset = FinetuneDataset(
+        data_path=args.data_path,
+        image_root=args.image_root,
+        max_samples=args.max_samples,
+        max_num_tiles=1,
+    )
+    total_num = len(full_dataset)
 
-            inputs = build_training_batch(batch_samples, base_model, tokenizer, device)
+    # ------------------------------------------------------------------
+    # 7. Define progressive distillation stages
+    # ------------------------------------------------------------------
+    distill_kwargs = dict(
+        feature_norm=args.feature_norm,
+        beta1=args.beta1,
+        beta2=args.beta2,
+        kd_temperature=args.kd_temperature,
+    )
 
-            outputs = model(**inputs)
-            loss = outputs.loss
+    if args.distill_mode and full_model is not None:
+        stage_names = ["tau1_visual_mse", "tau2_visual+llm_mse", "tau3_ce+kl"]
+        stage_fns = [
+            partial(train_step_tau1, **distill_kwargs),
+            partial(train_step_tau2, **distill_kwargs),
+            partial(train_step_tau3, **distill_kwargs),
+        ]
+        data_slices = _compute_data_slices(total_num)
+    else:
+        stage_names = ["finetune"]
+        stage_fns = [None]
+        data_slices = [(0, total_num)]
 
-            if args.distill_mode and full_model is not None:
-                with torch.no_grad():
-                    teacher_outputs = full_model(**inputs)
-                student_logits = outputs.logits
-                teacher_logits = teacher_outputs.logits
-                min_len = min(student_logits.shape[1], teacher_logits.shape[1])
-                kd_loss = F.kl_div(
-                    F.log_softmax(student_logits[:, :min_len] / args.kd_temperature, dim=-1),
-                    F.softmax(teacher_logits[:, :min_len] / args.kd_temperature, dim=-1),
-                    reduction="batchmean",
-                ) * (args.kd_temperature ** 2)
-                loss = (1 - args.kd_alpha) * loss + args.kd_alpha * kd_loss
+    logger.log(f"Total dataset: {total_num} samples")
+    logger.log(f"Number of stages: {len(stage_names)}")
+    for i, (name, sl) in enumerate(zip(stage_names, data_slices)):
+        logger.log(f"  Stage {i} ({name}): samples [{sl[0]}:{sl[1]}] ({sl[1]-sl[0]} samples)")
 
-            loss = loss / args.gradient_accumulation_steps
-            loss.backward()
+    # ------------------------------------------------------------------
+    # 8. Run each stage
+    # ------------------------------------------------------------------
+    old_state_dict = model.state_dict
 
-            epoch_loss += loss.item() * args.gradient_accumulation_steps
+    for stage_idx, (stage_name, stage_fn) in enumerate(zip(stage_names, stage_fns)):
+        sl_start, sl_end = data_slices[stage_idx]
+        if sl_start >= sl_end:
+            logger.log(f"Stage {stage_idx} ({stage_name}): no data, skipping.")
+            continue
 
-            if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-                global_step += 1
+        stage_dataset = deepcopy(full_dataset)
+        stage_dataset.data = full_dataset.data[sl_start:sl_end]
 
-            if (batch_idx + 1) % args.log_interval == 0:
-                avg_loss = epoch_loss / (batch_idx + 1)
-                lr_now = optimizer.param_groups[0]["lr"]
-                logger.log(
-                    f"Epoch {epoch+1}/{args.num_epochs}, "
-                    f"Step {batch_idx+1}/{len(dataloader)}, "
-                    f"Loss: {avg_loss:.4f}, LR: {lr_now:.2e}"
-                )
+        dataloader = DataLoader(
+            stage_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=2,
+            collate_fn=lambda batch: batch,
+            drop_last=True,
+        )
 
-        avg_epoch_loss = epoch_loss / max(len(dataloader), 1)
-        logger.log(f"Epoch {epoch+1} complete. Avg loss: {avg_epoch_loss:.4f}")
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+        total_steps = max(1, len(dataloader) * args.num_epochs // args.gradient_accumulation_steps)
+
+        def cosine_lr(step, _total=total_steps):
+            if step >= _total:
+                return 0.01
+            return 0.01 + 0.5 * (1.0 - 0.01) * (1 + math.cos(math.pi * step / _total))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=cosine_lr)
+
+        logger.log(f"=== Stage {stage_idx}: {stage_name} | "
+                    f"{len(stage_dataset)} samples, {args.num_epochs} epoch(s) ===")
+
+        global_step = 0
+        optimizer.zero_grad()
+        for epoch in range(args.num_epochs):
+            model.train()
+            epoch_loss = 0.0
+            for batch_idx, batch_samples in enumerate(dataloader):
+                base_model = student_base
+                inputs = build_training_batch(batch_samples, base_model, tokenizer, device)
+
+                if stage_fn is not None:
+                    loss = stage_fn(model, full_model, inputs)
+                else:
+                    outputs = model(**inputs)
+                    loss = outputs.loss
+
+                loss = loss / args.gradient_accumulation_steps
+                loss.backward()
+
+                epoch_loss += loss.item() * args.gradient_accumulation_steps
+
+                if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    global_step += 1
+
+                if (batch_idx + 1) % args.log_interval == 0:
+                    avg_loss = epoch_loss / (batch_idx + 1)
+                    lr_now = optimizer.param_groups[0]["lr"]
+                    logger.log(
+                        f"[{stage_name}] Epoch {epoch+1}/{args.num_epochs}, "
+                        f"Step {batch_idx+1}/{len(dataloader)}, "
+                        f"Loss: {avg_loss:.4f}, LR: {lr_now:.2e}"
+                    )
+
+            avg_epoch_loss = epoch_loss / max(len(dataloader), 1)
+            logger.log(f"[{stage_name}] Epoch {epoch+1} complete. Avg loss: {avg_epoch_loss:.4f}")
+
+        del optimizer, scheduler, dataloader, stage_dataset
+        torch.cuda.empty_cache()
+
+    for h in hook_list:
+        h.remove()
 
     # ------------------------------------------------------------------
     # 9. Merge LoRA and save
     # ------------------------------------------------------------------
-    logger.log("Merging LoRA weights into base model...")
+    logger.log("Merging adapter weights into base model...")
+    model.state_dict = old_state_dict
     model = model.merge_and_unload()
     model.eval()
 
@@ -494,20 +883,33 @@ if __name__ == "__main__":
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--lora_target_modules", type=str,
-                        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
+                        default="q,k,v,proj,fc1,fc2,q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
 
-    parser.add_argument("--num_epochs", type=int, default=3)
+    parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
     parser.add_argument("--log_interval", type=int, default=10)
 
     parser.add_argument("--distill_mode", action="store_true",
-                        help="Use full model as teacher for KD")
-    parser.add_argument("--kd_temperature", type=float, default=2.0)
-    parser.add_argument("--kd_alpha", type=float, default=0.5)
+                        help="Progressive distillation (paper Eq.13): "
+                             "τ1 visual MSE, τ2 visual+LLM MSE, τ3 CE+KL")
+    parser.add_argument("--kd_temperature", type=float, default=1.0,
+                        help="Temperature T for KL divergence in phase τ3")
+    parser.add_argument("--beta1", type=float, default=1.0,
+                        help="Weight β1 for vision MSE loss (Eq.13)")
+    parser.add_argument("--beta2", type=float, default=1.0,
+                        help="Weight β2 for language MSE loss (Eq.13)")
+    parser.add_argument("--feature_norm", action="store_true",
+                        help="Per-layer L2-normalize features before MSE (paper Eq.14)")
+
+    parser.add_argument("--wr_lora", action="store_true",
+                        help="Use PruneLora weight recalling structure (requires --pruned_mask)")
+    parser.add_argument("--pruned_mask", type=str, default=None,
+                        help="Path to prune_masks.json from pruning step")
+    parser.add_argument("--lora_pruned_r", type=int, default=8,
+                        help="Rank for the weight recalling branch")
 
     args = parser.parse_args()
     main(args)
-    
