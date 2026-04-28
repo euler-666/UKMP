@@ -489,6 +489,38 @@ class FinetuneDataset(Dataset):
         }
 
 
+def _build_prompt_from_template(model, question, answer=None):
+    """Build a prompt string using the model's own conversation template.
+
+    Mirrors how model.chat() constructs prompts so that train/eval formatting
+    is always consistent with the HuggingFace-shipped template (system message,
+    role tokens, separators, etc.).
+
+    Returns (full_prompt, assistant_prompt) where assistant_prompt is the
+    assistant turn only (used to locate where labels should start).
+    """
+    try:
+        template_name = model.template
+    except AttributeError:
+        template_name = model.config.template
+    from importlib import import_module
+    mod = import_module(type(model).__module__.rsplit(".", 1)[0] + ".conversation")
+    template = mod.get_conv_template(template_name)
+
+    template.system_message = model.system_message
+    template.append_message(template.roles[0], question)
+    template.append_message(template.roles[1], answer)
+    full_prompt = template.get_prompt()
+
+    assistant_role = template.roles[1]
+    if answer is not None:
+        assistant_prompt = assistant_role + answer + template.sep
+    else:
+        assistant_prompt = assistant_role
+
+    return full_prompt, assistant_prompt
+
+
 def build_training_batch(samples, model, tokenizer, device, num_image_token=256):
     """Build a training batch with proper chat-template formatting and labels."""
     pixel_values_list = []
@@ -496,9 +528,11 @@ def build_training_batch(samples, model, tokenizer, device, num_image_token=256)
     labels_list = []
 
     IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
+    IMG_START_TOKEN = "<img>"
+    IMG_END_TOKEN = "</img>"
 
-    nit = getattr(model, "num_image_token",
-                  getattr(getattr(model, "model", None), "num_image_token", num_image_token))
+    base_model = model.model if type(model).__name__ == "PeftModel" else model
+    nit = getattr(base_model, "num_image_token", num_image_token)
 
     for sample in samples:
         pv = sample["pixel_values"]
@@ -506,23 +540,22 @@ def build_training_batch(samples, model, tokenizer, device, num_image_token=256)
         num_patches = pv.shape[0]
 
         n_image_tok = nit * num_patches
-        image_tokens = IMG_CONTEXT_TOKEN * n_image_tok
-        question_with_image = f"<img>{image_tokens}</img>\n{sample['question']}"
+        image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * n_image_tok + IMG_END_TOKEN
+        question_with_image = f"{image_tokens}\n{sample['question']}"
 
-        user_part = f"<|im_start|>user\n{question_with_image}<|im_end|>\n"
-        assistant_part = f"<|im_start|>assistant\n{sample['answer']}<|im_end|>"
+        full_prompt, assistant_prompt = _build_prompt_from_template(
+            base_model, question_with_image, sample["answer"]
+        )
 
-        user_ids = tokenizer(user_part, add_special_tokens=False, return_tensors="pt")["input_ids"].squeeze(0)
-        assistant_ids = tokenizer(assistant_part, add_special_tokens=False, return_tensors="pt")["input_ids"].squeeze(0)
+        full_ids = tokenizer(full_prompt, add_special_tokens=False, return_tensors="pt")["input_ids"].squeeze(0)
+        assistant_ids = tokenizer(assistant_prompt, add_special_tokens=False, return_tensors="pt")["input_ids"].squeeze(0)
 
-        input_ids = torch.cat([user_ids, assistant_ids], dim=0)
-        labels = torch.cat([
-            torch.full_like(user_ids, -100),
-            assistant_ids,
-        ], dim=0)
+        prefix_len = full_ids.shape[0] - assistant_ids.shape[0]
+        labels = full_ids.clone()
+        labels[:prefix_len] = -100
 
         max_len = n_image_tok + 256
-        input_ids = input_ids[:max_len]
+        input_ids = full_ids[:max_len]
         labels = labels[:max_len]
 
         input_ids_list.append(input_ids)

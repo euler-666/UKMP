@@ -306,6 +306,36 @@ def build_calibration_loader(args, tokenizer, model):
     )
 
 
+def _build_prompt_from_template(model, question, answer=None):
+    """Build a prompt string using the model's own conversation template.
+
+    Mirrors how model.chat() constructs prompts so that train/eval formatting
+    is always consistent with the HuggingFace-shipped template.
+
+    Returns (full_prompt, assistant_prompt).
+    """
+    try:
+        template_name = model.template
+    except AttributeError:
+        template_name = model.config.template
+    from importlib import import_module
+    mod = import_module(type(model).__module__.rsplit(".", 1)[0] + ".conversation")
+    template = mod.get_conv_template(template_name)
+
+    template.system_message = model.system_message
+    template.append_message(template.roles[0], question)
+    template.append_message(template.roles[1], answer)
+    full_prompt = template.get_prompt()
+
+    assistant_role = template.roles[1]
+    if answer is not None:
+        assistant_prompt = assistant_role + answer + template.sep
+    else:
+        assistant_prompt = assistant_role
+
+    return full_prompt, assistant_prompt
+
+
 def prepare_internvl_inputs(samples, model, tokenizer, device):
     """Convert a list of {pixel_values, text, question} dicts into model-ready inputs with labels."""
     pixel_values_list = []
@@ -314,6 +344,8 @@ def prepare_internvl_inputs(samples, model, tokenizer, device):
     num_patches_list = []
 
     IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
+    IMG_START_TOKEN = "<img>"
+    IMG_END_TOKEN = "</img>"
     img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
     model.img_context_token_id = img_context_token_id
 
@@ -327,32 +359,23 @@ def prepare_internvl_inputs(samples, model, tokenizer, device):
         num_patches_list.append(num_patches)
 
         num_image_tokens = model.num_image_token * num_patches
-        image_tokens = IMG_CONTEXT_TOKEN * num_image_tokens
-        question = f"<img>{image_tokens}</img>\n{user_question}"
+        image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * num_image_tokens + IMG_END_TOKEN
+        question = f"{image_tokens}\n{user_question}"
 
-        prompt = (
-            f"<|im_start|>user\n{question}<|im_end|>\n"
-            f"<|im_start|>assistant\n{text}<|im_end|>"
+        full_prompt, assistant_prompt = _build_prompt_from_template(
+            model, question, text
         )
 
-        tokenized = tokenizer(prompt, return_tensors="pt", truncation=True,
+        tokenized = tokenizer(full_prompt, return_tensors="pt", truncation=True,
                               max_length=512, padding="max_length")
         input_ids = tokenized["input_ids"].squeeze(0)
 
-        # Mask labels: only the assistant response tokens should contribute to loss.
-        # Everything before (and including) "<|im_start|>assistant\n" gets -100.
-        assistant_marker = "<|im_start|>assistant\n"
-        assistant_ids = tokenizer.encode(assistant_marker, add_special_tokens=False)
-        marker_len = len(assistant_ids)
-        ids_list = input_ids.tolist()
-        ans_start = len(ids_list)
-        for j in range(len(ids_list) - marker_len + 1):
-            if ids_list[j:j + marker_len] == assistant_ids:
-                ans_start = j + marker_len
-                break
+        unpadded_ids = tokenizer(full_prompt, add_special_tokens=False, return_tensors="pt")["input_ids"].squeeze(0)
+        assistant_ids = tokenizer(assistant_prompt, add_special_tokens=False, return_tensors="pt")["input_ids"].squeeze(0)
+        prefix_len = len(unpadded_ids) - len(assistant_ids)
 
         labels = input_ids.clone()
-        labels[:ans_start] = -100
+        labels[:prefix_len] = -100
         labels[labels == tokenizer.pad_token_id] = -100
 
         input_ids_list.append(input_ids)
@@ -376,6 +399,8 @@ def prepare_internvl_inputs(samples, model, tokenizer, device):
 def prepare_internvl_inputs_simple(model, tokenizer, device, batch_size=1):
     """Prepare minimal dummy inputs for FLOPs analysis / graph tracing."""
     IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
+    IMG_START_TOKEN = "<img>"
+    IMG_END_TOKEN = "</img>"
     img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
     if img_context_token_id is None:
         img_context_token_id = 0
@@ -384,14 +409,11 @@ def prepare_internvl_inputs_simple(model, tokenizer, device, batch_size=1):
     num_image_tokens = model.num_image_token  # 256 per tile, 1 tile minimum
     pixel_values = torch.randn(1, 3, 448, 448, device=device, dtype=model.dtype)
 
-    image_tokens = IMG_CONTEXT_TOKEN * num_image_tokens
-    prompt = (
-        f"<|im_start|>user\n<img>{image_tokens}</img>\n"
-        f"Describe this image.<|im_end|>\n"
-        f"<|im_start|>assistant\nA photo.<|im_end|>"
-    )
+    image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * num_image_tokens + IMG_END_TOKEN
+    question = f"{image_tokens}\nDescribe this image."
+    full_prompt, _ = _build_prompt_from_template(model, question, "A photo.")
 
-    tokenized = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+    tokenized = tokenizer(full_prompt, return_tensors="pt", truncation=True, max_length=512)
     input_ids = tokenized["input_ids"].to(device)
     attention_mask = tokenized["attention_mask"].to(device)
     labels = input_ids.clone()
