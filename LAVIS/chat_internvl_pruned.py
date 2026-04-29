@@ -261,7 +261,7 @@ def parse_input(user_input):
         parts = user_input.split(None, 1)
         image_path = parts[0]
         question = parts[1] if len(parts) > 1 else "Describe this image."
-    return image_path, question
+    return os.path.expanduser(image_path), question
 
 
 def main():
@@ -271,6 +271,8 @@ def main():
                         help="Path to pruned/finetuned model dir (with model.pt + pruned_shapes.json)")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--max_new_tokens", type=int, default=512)
+    parser.add_argument("--max_num_tiles", type=int, default=6,
+                        help="Max image tiles for dynamic preprocessing (match training setting)")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -310,6 +312,7 @@ def main():
 
         # If input looks like it starts with a file path, parse image + question
         first_token = user_input.split('"')[1] if user_input.startswith('"') else user_input.split()[0]
+        first_token = os.path.expanduser(first_token)
         if os.path.exists(first_token) or any(first_token.lower().endswith(ext)
                                                 for ext in ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.tiff')):
             image_path, question = parse_input(user_input)
@@ -319,7 +322,7 @@ def main():
                 continue
 
             try:
-                current_pixels = load_image(image_path, input_size=448, max_num=12).to(device).to(dtype)
+                current_pixels = load_image(image_path, input_size=448, max_num=args.max_num_tiles).to(device).to(dtype)
                 current_image = image_path
                 history = []
                 print(f"  [Loaded image: {image_path}]")

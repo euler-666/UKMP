@@ -29,7 +29,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from transformers import AutoModel, AutoTokenizer
 from PIL import Image
@@ -48,6 +51,33 @@ from lavis.peft.tuners.prunelora.layer import Linear as PruneLoraLinear
 
 NUM_VIT_LAYERS = 24
 NUM_LLM_LAYERS = 28
+
+
+def is_dist():
+    return dist.is_initialized() and dist.get_world_size() > 1
+
+
+def get_rank():
+    return dist.get_rank() if dist.is_initialized() else 0
+
+
+def get_world_size():
+    return dist.get_world_size() if dist.is_initialized() else 1
+
+
+def is_main_process():
+    return get_rank() == 0
+
+
+def setup_distributed():
+    """Initialize DDP when launched via torchrun / torch.distributed.launch."""
+    if "RANK" not in os.environ:
+        return 0, torch.device("cuda")
+
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    return local_rank, torch.device("cuda", local_rank)
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +282,8 @@ def _enable_vit_grads(inputs):
 
 
 def _get_student_base(student_model):
-    return student_model.model if type(student_model).__name__ == "PeftModel" else student_model
+    m = student_model.module if isinstance(student_model, DDP) else student_model
+    return m.model if type(m).__name__ == "PeftModel" else m
 
 
 def _run_both(student_model, teacher_model, inputs):
@@ -433,15 +464,69 @@ def load_pruned_model(model_name, pruned_ckpt_dir, device, dtype=torch.bfloat16)
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
-class FinetuneDataset(Dataset):
-    def __init__(self, data_path, image_root, max_samples=None,
-                 image_size=448, max_num_tiles=1):
+def _load_data_file(data_path):
+    """Load a JSON array or a JSONL file into a list of dicts."""
+    if data_path.endswith(".jsonl"):
+        data = []
         with open(data_path, "r") as f:
-            raw = json.load(f)
+            for line in f:
+                line = line.strip()
+                if line:
+                    data.append(json.loads(line))
+        return data
+    else:
+        with open(data_path, "r") as f:
+            return json.load(f)
+
+
+def load_sft_datasets(data_config_path):
+    """Load multiple SFT datasets from a config JSON file.
+
+    Config format (list of dataset specs):
+    [
+      {"annotation": "path/to/file.jsonl", "image_root": "path/to/images/", "max_samples": 10000},
+      {"annotation": "path/to/another.jsonl", "image_root": "path/to/other_images/"},
+      ...
+    ]
+
+    Returns a flat list of (item_dict, image_root) tuples.
+    """
+    with open(data_config_path, "r") as f:
+        config = json.load(f)
+
+    all_items = []
+    for ds in config:
+        annotation = ds["annotation"]
+        image_root = ds["image_root"]
+        max_samples = ds.get("max_samples", None)
+        raw = _load_data_file(annotation)
         if max_samples is not None:
             random.shuffle(raw)
             raw = raw[:max_samples]
-        self.data = raw
+        for item in raw:
+            all_items.append((item, image_root))
+    random.shuffle(all_items)
+    return all_items
+
+
+class FinetuneDataset(Dataset):
+    def __init__(self, data_path, image_root, max_samples=None,
+                 image_size=448, max_num_tiles=1, data_config=None):
+        if data_config is not None:
+            paired = load_sft_datasets(data_config)
+            if max_samples is not None:
+                paired = paired[:max_samples]
+            self.data = [item for item, _ in paired]
+            self.image_roots = [root for _, root in paired]
+            self.multi_root = True
+        else:
+            raw = _load_data_file(data_path)
+            if max_samples is not None:
+                random.shuffle(raw)
+                raw = raw[:max_samples]
+            self.data = raw
+            self.image_roots = None
+            self.multi_root = False
         self.image_root = image_root
         self.image_size = image_size
         self.max_num_tiles = max_num_tiles
@@ -453,7 +538,8 @@ class FinetuneDataset(Dataset):
         item = self.data[idx]
         img_path = item.get("image", "")
         if not os.path.isabs(img_path):
-            img_path = os.path.join(self.image_root, img_path)
+            root = self.image_roots[idx] if self.multi_root else self.image_root
+            img_path = os.path.join(root, img_path)
 
         try:
             image = Image.open(img_path).convert("RGB")
@@ -471,9 +557,11 @@ class FinetuneDataset(Dataset):
                 val = turn.get("value", turn.get("content", ""))
                 val = val.replace("<image>", "").strip()
                 if role in ("human", "user"):
-                    question = val
+                    if not question:
+                        question = val
                 elif role in ("gpt", "assistant"):
-                    answer = val
+                    if not answer:
+                        answer = val
             if not question:
                 question = "Describe this image."
             if not answer:
@@ -589,17 +677,25 @@ def build_training_batch(samples, model, tokenizer, device, num_image_token=256)
 # Main
 # ---------------------------------------------------------------------------
 def main(args):
-    setup_seeds(args.seed)
+    local_rank, device = setup_distributed()
+    args.device = str(device)
+    setup_seeds(args.seed + get_rank())
 
-    logger = LoggerWithDepth(
-        env_name="{}".format(args.save_ckpt_log_name),
-        config=args.__dict__,
-        root_dir="tuned_checkpoint",
-        setup_sublogger=True,
-        sublogger_name=args.job_id,
-    )
-
-    device = torch.device(args.device)
+    if is_main_process():
+        logger = LoggerWithDepth(
+            env_name="{}".format(args.save_ckpt_log_name),
+            config=args.__dict__,
+            root_dir="tuned_checkpoint",
+            setup_sublogger=True,
+            sublogger_name=args.job_id,
+        )
+    else:
+        class _SilentLogger:
+            """No-op logger for non-rank-0 processes."""
+            def __getattr__(self, _):
+                return lambda *a, **kw: None
+            sub_dir = "/tmp"
+        logger = _SilentLogger()
 
     # ------------------------------------------------------------------
     # 1. Load tokenizer
@@ -735,7 +831,8 @@ def main(args):
         model = get_peft_model(model, lora_config)
         model.to(device)
 
-    model.print_trainable_parameters()
+    if is_main_process():
+        model.print_trainable_parameters()
 
     if args.distill_mode:
         logger.log("Registering feature hooks on student...")
@@ -755,15 +852,31 @@ def main(args):
     if full_model is not None:
         full_model.img_context_token_id = img_context_token_id
 
+    # Save reference before DDP wrapping (needed for merge_and_unload later)
+    old_state_dict = model.state_dict
+
+    # ------------------------------------------------------------------
+    # 5b. Wrap student model in DDP for multi-GPU training
+    # ------------------------------------------------------------------
+    if is_dist():
+        model = DDP(model, device_ids=[local_rank],
+                    find_unused_parameters=True)
+        logger.log(f"Wrapped model in DDP across {get_world_size()} GPUs")
+
     # ------------------------------------------------------------------
     # 6. Build dataset
     # ------------------------------------------------------------------
+    if not args.data_config and not args.data_path:
+        raise ValueError("Either --data_config or --data_path must be provided.")
+
     full_dataset = FinetuneDataset(
         data_path=args.data_path,
-        image_root=args.image_root,
+        image_root=args.image_root or "",
         max_samples=args.max_samples,
-        max_num_tiles=1,
+        max_num_tiles=args.max_num_tiles,
+        data_config=args.data_config,
     )
+    logger.log(f"Image tiling: max_num_tiles={args.max_num_tiles}")
     total_num = len(full_dataset)
 
     # ------------------------------------------------------------------
@@ -797,8 +910,6 @@ def main(args):
     # ------------------------------------------------------------------
     # 8. Run each stage
     # ------------------------------------------------------------------
-    old_state_dict = model.state_dict
-
     for stage_idx, (stage_name, stage_fn) in enumerate(zip(stage_names, stage_fns)):
         sl_start, sl_end = data_slices[stage_idx]
         if sl_start >= sl_end:
@@ -807,14 +918,19 @@ def main(args):
 
         stage_dataset = deepcopy(full_dataset)
         stage_dataset.data = full_dataset.data[sl_start:sl_end]
+        if getattr(full_dataset, 'multi_root', False):
+            stage_dataset.image_roots = full_dataset.image_roots[sl_start:sl_end]
 
+        sampler = DistributedSampler(stage_dataset, shuffle=True) if is_dist() else None
         dataloader = DataLoader(
             stage_dataset,
             batch_size=args.batch_size,
-            shuffle=True,
+            shuffle=(sampler is None),
+            sampler=sampler,
             num_workers=2,
             collate_fn=lambda batch: batch,
             drop_last=True,
+            pin_memory=True,
         )
 
         trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -829,29 +945,47 @@ def main(args):
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=cosine_lr)
 
         logger.log(f"=== Stage {stage_idx}: {stage_name} | "
-                    f"{len(stage_dataset)} samples, {args.num_epochs} epoch(s) ===")
+                    f"{len(stage_dataset)} samples, {args.num_epochs} epoch(s), "
+                    f"{get_world_size()} GPU(s) ===")
 
         global_step = 0
         optimizer.zero_grad()
         for epoch in range(args.num_epochs):
+            if sampler is not None:
+                sampler.set_epoch(epoch)
             model.train()
             epoch_loss = 0.0
+            # τ1/τ2 compute loss from hooked features, not from the model's
+            # forward output. DDP's reducer can't trace that gradient path,
+            # so we use no_sync() and manually allreduce gradients instead.
+            uses_hook_loss = stage_fn is not None and stage_name != "tau3_ce+kl"
+
             for batch_idx, batch_samples in enumerate(dataloader):
                 base_model = student_base
                 inputs = build_training_batch(batch_samples, base_model, tokenizer, device)
 
-                if stage_fn is not None:
+                if uses_hook_loss and is_dist():
+                    with model.no_sync():
+                        loss = stage_fn(model, full_model, inputs)
+                        loss = loss / args.gradient_accumulation_steps
+                        loss.backward()
+                elif stage_fn is not None:
                     loss = stage_fn(model, full_model, inputs)
+                    loss = loss / args.gradient_accumulation_steps
+                    loss.backward()
                 else:
                     outputs = model(**inputs)
                     loss = outputs.loss
-
-                loss = loss / args.gradient_accumulation_steps
-                loss.backward()
+                    loss = loss / args.gradient_accumulation_steps
+                    loss.backward()
 
                 epoch_loss += loss.item() * args.gradient_accumulation_steps
 
                 if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
+                    if uses_hook_loss and is_dist():
+                        for p in trainable_params:
+                            if p.grad is not None:
+                                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
                     torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                     optimizer.step()
                     scheduler.step()
@@ -871,30 +1005,44 @@ def main(args):
             logger.log(f"[{stage_name}] Epoch {epoch+1} complete. Avg loss: {avg_epoch_loss:.4f}")
 
         del optimizer, scheduler, dataloader, stage_dataset
+        if sampler is not None:
+            del sampler
         torch.cuda.empty_cache()
 
     for h in hook_list:
         h.remove()
 
     # ------------------------------------------------------------------
-    # 9. Merge LoRA and save
+    # 9. Merge LoRA and save (rank 0 only)
     # ------------------------------------------------------------------
+    if is_dist():
+        dist.barrier()
+
+    # Unwrap DDP before merge
+    if is_dist():
+        model = model.module
+
     logger.log("Merging adapter weights into base model...")
     model.state_dict = old_state_dict
     model = model.merge_and_unload()
     model.eval()
 
-    save_dir = os.path.join(logger.sub_dir, "finetuned_model")
-    os.makedirs(save_dir, exist_ok=True)
+    if is_main_process():
+        save_dir = os.path.join(logger.sub_dir, "finetuned_model")
+        os.makedirs(save_dir, exist_ok=True)
 
-    torch.save(model.state_dict(), os.path.join(save_dir, "model.pt"))
-    shape_map = {name: list(p.shape) for name, p in model.named_parameters()}
-    with open(os.path.join(save_dir, "pruned_shapes.json"), "w") as f:
-        json.dump(shape_map, f)
-    tokenizer.save_pretrained(save_dir)
+        torch.save(model.state_dict(), os.path.join(save_dir, "model.pt"))
+        shape_map = {name: list(p.shape) for name, p in model.named_parameters()}
+        with open(os.path.join(save_dir, "pruned_shapes.json"), "w") as f:
+            json.dump(shape_map, f)
+        tokenizer.save_pretrained(save_dir)
 
-    logger.log(f"Fine-tuned model saved to {save_dir}")
-    logger.log("[FINISH] - Finish Fine-tuning Pruned InternVL Model")
+        logger.log(f"Fine-tuned model saved to {save_dir}")
+        logger.log("[FINISH] - Finish Fine-tuning Pruned InternVL Model")
+
+    if is_dist():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
@@ -908,8 +1056,15 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--data_path", type=str, required=True)
-    parser.add_argument("--image_root", type=str, required=True)
+    parser.add_argument("--data_path", type=str, default=None,
+                        help="Path to training data (JSON array or JSONL). "
+                             "Not needed when --data_config is used.")
+    parser.add_argument("--image_root", type=str, default=None,
+                        help="Root dir for images. Not needed when --data_config is used.")
+    parser.add_argument("--data_config", type=str, default=None,
+                        help="Path to a JSON config listing multiple SFT datasets. "
+                             "Each entry: {annotation, image_root, max_samples(optional)}. "
+                             "When set, --data_path/--image_root are ignored.")
     parser.add_argument("--max_samples", type=int, default=None)
 
     parser.add_argument("--lora_r", type=int, default=16)
@@ -923,6 +1078,9 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    parser.add_argument("--max_num_tiles", type=int, default=6,
+                        help="Max image tiles for dynamic preprocessing. "
+                             "Higher = better OCR but more VRAM. (1=thumbnail only, 12=full)")
     parser.add_argument("--log_interval", type=int, default=10)
 
     parser.add_argument("--distill_mode", action="store_true",

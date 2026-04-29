@@ -5,6 +5,7 @@ Stages: Prune -> Evaluate Pruned -> Fine-tune -> Evaluate Fine-tuned
 import subprocess
 
 GPU = "0"
+NGPU = 1           # number of GPUs for finetuning (set >1 for multi-GPU DDP)
 port = 18082
 
 # ---- Pruning configuration ----
@@ -100,8 +101,14 @@ wr_lora_str = "-wr_lora" if wr_lora else ""
 distill_str = "-distill" if distill else ""
 tune_job_id = f"{job_id}+finetune{wr_lora_str}{distill_str}"
 
+if NGPU > 1:
+    gpu_list = ",".join(str(i) for i in range(NGPU))
+    launcher = f"CUDA_VISIBLE_DEVICES={gpu_list} torchrun --nproc_per_node={NGPU}"
+else:
+    launcher = f"CUDA_VISIBLE_DEVICES={GPU} python -u"
+
 program = (
-    f"CUDA_VISIBLE_DEVICES={GPU} python -u ukmp_finetune_internvl.py"
+    f"{launcher} ukmp_finetune_internvl.py"
     f" --model_name {MODEL_NAME}"
     f" --device cuda"
     f" --save_ckpt_log_name ukmp_finetune_internvl"
