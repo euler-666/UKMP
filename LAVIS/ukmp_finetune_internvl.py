@@ -335,12 +335,22 @@ def train_step_tau2(student_model, teacher_model, inputs,
     return beta1 * v_loss + beta2 * l_loss
 
 
+_tau3_log_counter = 0
+
 def train_step_tau3(student_model, teacher_model, inputs,
                     kd_temperature=1.0, **_kw):
     """Phase τ3 (Eq.13): Ltask(ys, y) + Lkl(ps, pt)
-    — task CE loss + KL divergence on logits."""
+    — task CE loss + KL divergence on logits.
+
+    KL is computed ONLY over label-token positions (where labels != -100)
+    so that prompt/padding tokens don't inflate the divergence.
+    If a sample has zero label tokens, return a zero loss (no signal).
+    """
+    global _tau3_log_counter
+
+    labels = inputs.get("labels", None)
     outputs = student_model(**inputs)
-    loss = outputs.loss
+    ce_loss = outputs.loss
 
     with torch.no_grad():
         teacher_outputs = teacher_model(**inputs)
@@ -349,14 +359,53 @@ def train_step_tau3(student_model, teacher_model, inputs,
     teacher_logits = teacher_outputs.logits
     min_len = min(student_logits.shape[1], teacher_logits.shape[1])
 
-    T = kd_temperature
-    kl_loss = F.kl_div(
-        F.log_softmax(student_logits[:, :min_len] / T, dim=-1),
-        F.softmax(teacher_logits[:, :min_len] / T, dim=-1),
-        reduction="batchmean",
-    ) * (T ** 2)
+    # Build mask: True for positions where the model is actually supervised
+    if labels is not None:
+        label_mask = (labels[:, :min_len] != -100)   # (B, min_len)
+        n_label_tokens = label_mask.sum().item()
+    else:
+        label_mask = None
+        n_label_tokens = min_len
 
-    return loss + kl_loss
+    # If no label tokens at all, CE is NaN — return a zero loss with grad
+    if n_label_tokens == 0:
+        _tau3_log_counter += 1
+        if _tau3_log_counter <= 10 or _tau3_log_counter % 50 == 0:
+            print(f"[tau3-diag step={_tau3_log_counter}] SKIP: n_label_tokens=0")
+        return (student_logits.sum() * 0.0).requires_grad_(True)
+
+    T = kd_temperature
+    s_logits_f = student_logits[:, :min_len].float() / T
+    t_logits_f = teacher_logits[:, :min_len].float() / T
+
+    s_log = F.log_softmax(s_logits_f, dim=-1)        # (B, min_len, V)
+    t_prob = F.softmax(t_logits_f, dim=-1)
+
+    # Per-token KL: sum over vocab dimension -> (B, min_len)
+    per_token_kl = F.kl_div(s_log, t_prob, reduction="none").sum(dim=-1)
+
+    # Mask to label positions only and average over them
+    if label_mask is not None:
+        per_token_kl = per_token_kl * label_mask.float()
+    kl_loss = per_token_kl.sum() / max(n_label_tokens, 1) * (T ** 2)
+
+    _tau3_log_counter += 1
+    if _tau3_log_counter <= 10 or _tau3_log_counter % 50 == 0:
+        with torch.no_grad():
+            s_abs = student_logits[:, :min_len].float().abs()
+            t_abs = teacher_logits[:, :min_len].float().abs()
+            print(
+                f"[tau3-diag step={_tau3_log_counter}] "
+                f"seq_len={min_len}, "
+                f"n_label_tokens={n_label_tokens}, "
+                f"ce_loss={ce_loss.item():.4f}, "
+                f"kl_loss={kl_loss.item():.4f}, "
+                f"total={ce_loss.item() + kl_loss.item():.4f}, "
+                f"student_logit max={s_abs.max().item():.1f} mean={s_abs.mean().item():.2f}, "
+                f"teacher_logit max={t_abs.max().item():.1f} mean={t_abs.mean().item():.2f}"
+            )
+
+    return ce_loss + kl_loss.to(ce_loss.dtype)
 
 
 def _compute_data_slices(total_samples):
@@ -967,21 +1016,37 @@ def main(args):
                 if uses_hook_loss and is_dist():
                     with model.no_sync():
                         loss = stage_fn(model, full_model, inputs)
-                        loss = loss / args.gradient_accumulation_steps
-                        loss.backward()
                 elif stage_fn is not None:
                     loss = stage_fn(model, full_model, inputs)
-                    loss = loss / args.gradient_accumulation_steps
-                    loss.backward()
                 else:
                     outputs = model(**inputs)
                     loss = outputs.loss
-                    loss = loss / args.gradient_accumulation_steps
-                    loss.backward()
 
-                epoch_loss += loss.item() * args.gradient_accumulation_steps
+                loss_val = loss.item()
+                bad_loss = math.isnan(loss_val) or math.isinf(loss_val)
+
+                if bad_loss:
+                    # Zero the loss but keep the computation graph connected
+                    # so DDP's allreduce still fires for all ranks.
+                    loss = loss * 0.0
+                    loss_val = 0.0
+
+                loss = loss / args.gradient_accumulation_steps
+                loss.backward()
+                if not bad_loss:
+                    epoch_loss += loss_val
 
                 if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
+                    # Check for NaN in gradients and skip the step if found
+                    has_nan = any(
+                        torch.isnan(p.grad).any() for p in trainable_params
+                        if p.grad is not None
+                    )
+                    if has_nan:
+                        optimizer.zero_grad()
+                        global_step += 1
+                        continue
+
                     if uses_hook_loss and is_dist():
                         for p in trainable_params:
                             if p.grad is not None:
