@@ -18,6 +18,6 @@ datasets:
               - /export/home/workspace/datasets/cc3m.json 
               # TODO change
           storage:
-              - /{dir_path}/datasets/conceptual_caption/cc595k.json
+              - /home/rishabh/UKMP/LLaVA-CC3M-Pretrain-595K/cc595k.json
       images:
-          storage: /{dir_path}/datasets/conceptual_caption/cc3m_595k_images
+          storage: /home/rishabh/UKMP/LLaVA-CC3M-Pretrain-595K/images

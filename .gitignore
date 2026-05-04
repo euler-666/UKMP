@@ -164,4 +164,6 @@ cache/
 
 
 LAVIS/eval_results/
+LAVIS/data/
+InternVL/eval_results/
 LLaVA-CC3M-Pretrain-595K/

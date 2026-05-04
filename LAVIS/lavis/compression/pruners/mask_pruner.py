@@ -286,74 +286,6 @@ class T5LayerNormMaskPruner(BaseMaskPruningFunc):
         return layer
     operate_in_masks = operate_out_masks
     
-class RMSNormMaskPruner(BaseMaskPruningFunc):
-    """Mask pruner for RMSNorm layers (e.g. Qwen3RMSNorm).
-    RMSNorm has a single weight vector (no bias), indexed along dim 0."""
-
-    def prune_out_channels(self, layer: nn.Module, idxs: Sequence[int]) -> nn.Module:
-        idxs.sort()
-        self._prune_parameter_and_grad(layer.weight, idxs, 0)
-        return layer
-
-    prune_in_channels = prune_out_channels
-
-    def get_out_channels(self, layer):
-        return layer.weight.size(0)
-
-    def masked_get_out_channels(self, layer):
-        return layer.weight.preserve_masks[0].sum()
-
-    def get_in_channels(self, layer):
-        return layer.weight.size(0)
-
-    def masked_get_in_channels(self, layer):
-        return layer.weight.preserve_masks[0].sum()
-
-    def operate_out_masks(self, layer, mode):
-        if mode == 'init':
-            layer.weight.preserve_masks[0].fill_(1)
-        elif mode == 'compress':
-            keep_idxs = layer.weight.preserve_masks[0].nonzero().view(-1)
-            layer.weight = self._compress_parameter(layer.weight, keep_idxs, 0)
-        else:
-            raise NotImplementedError
-        return layer
-    operate_in_masks = operate_out_masks
-
-
-class GQAAttentionHeadMaskPruner(BaseMaskPruningFunc):
-    """Mask pruner for GQA attention modules (e.g. Qwen3Attention).
-    Tracks pruned heads and respects the Q-to-KV grouping ratio."""
-
-    def prune_out_channels(self, layer: nn.Module, idxs: Sequence[int]) -> nn.Module:
-        raise NotImplementedError("Can't be called directly")
-
-    prune_in_channels = prune_out_channels
-
-    def get_out_channels(self, layer):
-        raise NotImplementedError("Only a triggered function, can't be called")
-
-    def get_in_channels(self, layer):
-        raise NotImplementedError("Only a triggered function, can't be called")
-
-    def masked_get_out_channels(self, layer):
-        raise NotImplementedError("Only a triggered function, can't be called")
-
-    def masked_get_in_channels(self, layer):
-        raise NotImplementedError("Only a triggered function, can't be called")
-
-    def operate_out_masks(self, layer, mode, prune_idxs):
-        if mode == 'init':
-            raise NotImplementedError("Can't be called")
-        elif mode == 'compress':
-            head_dim = layer.head_dim
-            layer.pruned_heads = set(
-                list((idx // head_dim).item() for idx in prune_idxs)
-            )
-        else:
-            raise NotImplementedError
-
-
 class T5AttentionHeadMaskPruner(BaseMaskPruningFunc):
 
     def prune_out_channels(self, layer: nn.Module, idxs: Sequence[int]) -> nn.Module:
@@ -398,8 +330,6 @@ function.prune_parameter_out_channels = param_mask_pruner.prune_out_channels
 
 t5_layer_norm_mask_pruner = T5LayerNormMaskPruner() 
 t5_attention_head_mask_pruner = T5AttentionHeadMaskPruner()
-rms_norm_mask_pruner = RMSNormMaskPruner()
-gqa_attention_head_mask_pruner = GQAAttentionHeadMaskPruner()
 
 ##############################
 # Importance

@@ -90,11 +90,9 @@ subprocess.call(program, shell=True)
 
 print("[START] - Start Evaluating Finetuned Model")
 eval_job_id = "evaluate_finetuned"
-for task in ["okvqa_zeroshot_flant5xl_eval", "gqa_zeroshot_flant5xl_eval", "nocaps_pretrain_flant5xl_eval", "ret_flickr_pretrain_flant5xl_eval", "vqav2_zeroshot_flant5xl_eval"]:
-    if "nocaps" in task:
-        eval_job_id = eval_job_id + "_" + tune_job_id
-    else:
-        eval_job_id = "evaluate_finetuned"
+for task in ["okvqa_zeroshot_flant5xl_eval", "gqa_zeroshot_flant5xl_eval", "vqav2_zeroshot_flant5xl_eval"]:
+    # "nocaps_pretrain_flant5xl_eval", "ret_flickr_pretrain_flant5xl_eval" skipped (images not downloaded)
+    eval_job_id = "evaluate_finetuned"
     program = (
         f"CUDA_VISIBLE_DEVICES={GPU} python -u evaluate_blip2_pruned.py"
         f" --cfg-path lavis/projects/blip2/eval/{task}.yaml"

@@ -31,6 +31,7 @@ from transformers.modeling_outputs import (
     BaseModelOutput, BaseModelOutputWithPastAndCrossAttentions,
     Seq2SeqLMOutput, Seq2SeqModelOutput)
 from transformers.modeling_utils import PreTrainedModel
+from transformers import GenerationMixin, GenerationConfig
 from transformers.models.t5.configuration_t5 import T5Config
 from transformers.pytorch_utils import (ALL_LAYERNORM_LAYERS,
                                         find_pruneable_heads_and_indices,
@@ -1663,7 +1664,7 @@ class T5Model(T5PreTrainedModel):
 @add_start_docstrings(
     """T5 Model with a `language modeling` head on top.""", T5_START_DOCSTRING
 )
-class T5ForConditionalGeneration(T5PreTrainedModel):
+class T5ForConditionalGeneration(T5PreTrainedModel, GenerationMixin):
     _keys_to_ignore_on_load_missing = [
         r"encoder.embed_tokens.weight",
         r"decoder.embed_tokens.weight",
@@ -1695,6 +1696,9 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+        if self.generation_config is None:
+            self.generation_config = GenerationConfig.from_model_config(config)
 
         # Model parallel
         self.model_parallel = False

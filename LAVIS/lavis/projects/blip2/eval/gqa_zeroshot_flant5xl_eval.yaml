@@ -21,7 +21,7 @@ datasets:
           name: "blip_question"
     build_info:
         images:
-            storage: "/{dir_path}/datasets/gqa/images/"
+            storage: "/home/rishabh/InternVL-Chat-V1-2-SFT-Data/data/gqa/images/"
 
 run:
   task: gqa

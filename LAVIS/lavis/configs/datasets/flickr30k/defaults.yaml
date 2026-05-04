@@ -12,13 +12,13 @@ datasets:
       annotations:
         train:
           url: https://storage.googleapis.com/sfr-vision-language-research/datasets/flickr30k_train.json
-          storage: /{dir_path}/datasets/flickr30k/annotations/train.json
+          storage: /home/rishabh/UKMP/LAVIS/data/datasets/flickr30k/annotations/train.json
         val:
           url: https://storage.googleapis.com/sfr-vision-language-research/datasets/flickr30k_val.json
-          storage: /{dir_path}/datasets/flickr30k/annotations/val.json
+          storage: /home/rishabh/UKMP/LAVIS/data/datasets/flickr30k/annotations/val.json
         test:
           url: https://storage.googleapis.com/sfr-vision-language-research/datasets/flickr30k_test.json
-          storage: /{dir_path}/datasets/flickr30k/annotations/test.json
+          storage: /home/rishabh/UKMP/LAVIS/data/datasets/flickr30k/annotations/test.json
       images:
-          storage: /{dir_path}/datasets/flickr30k/images
+          storage: /home/rishabh/UKMP/LAVIS/data/datasets/flickr30k/images
           # storage: /export/share/datasets/vision/flickr30k

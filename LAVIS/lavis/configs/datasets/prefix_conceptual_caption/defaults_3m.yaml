@@ -15,6 +15,6 @@ datasets:
           url:
               - /export/home/workspace/datasets/cc3m.json
           storage:
-              - /{dir_path}/datasets/conceptual_caption/cc3m.json
+              - /home/rishabh/UKMP/LAVIS/data/datasets/conceptual_caption/cc3m.json
       images:
-          storage: /{dir_path}/datasets/conceptual_caption/images
+          storage: /home/rishabh/UKMP/LAVIS/data/datasets/conceptual_caption/images
