@@ -123,15 +123,16 @@ class VQADataset(Dataset):
         else:
             question = item.get("question", item.get("text", "Describe this image."))
             answer = item.get("answer", item.get("answers", ""))
-        if isinstance(answer, list):
-            answer = answer[0] if len(answer) > 0 else ""
         qid = item.get("question_id", item.get("id", idx))
+
+        category = item.get("category", "")
 
         return {
             "image": image,
             "question": question,
             "answer": answer,
             "question_id": qid,
+            "category": category,
         }
 
 
@@ -287,6 +288,122 @@ def evaluate_generation(model, tokenizer, dataset, device, output_path=None, num
     return results
 
 
+def _ocrbench_match(answers, predict, category):
+    """OCRBench scoring: answer substring containment (VLMEvalKit convention)."""
+    if category == "Handwritten Mathematical Expression Recognition":
+        for ans in answers:
+            a = ans.strip().replace("\n", " ").replace(" ", "")
+            p = predict.strip().replace("\n", " ").replace(" ", "")
+            if a in p:
+                return True
+    else:
+        for ans in answers:
+            a = ans.lower().strip().replace("\n", " ")
+            p = predict.lower().strip().replace("\n", " ")
+            if a in p:
+                return True
+    return False
+
+
+OCRBENCH_AGG = {
+    "Text Recognition": [
+        "Regular Text Recognition", "Irregular Text Recognition",
+        "Artistic Text Recognition", "Handwriting Recognition",
+        "Digit String Recognition", "Non-Semantic Text Recognition",
+    ],
+    "Scene Text-centric VQA": ["Scene Text-centric VQA"],
+    "Doc-oriented VQA": ["Doc-oriented VQA"],
+    "Key Information Extraction": ["Key Information Extraction"],
+    "Handwritten Math Expr Recognition": [
+        "Handwritten Mathematical Expression Recognition"
+    ],
+}
+
+
+def evaluate_ocrbench(model, tokenizer, dataset, device, output_path=None):
+    """Run full OCRBench evaluation with per-category scoring.
+
+    Expects dataset items to have 'answer' (list of acceptable strings)
+    and 'category'.
+    """
+    per_cat = {}
+    per_cat_total = {}
+    results = []
+    total_correct = 0
+
+    for idx in range(len(dataset)):
+        sample = dataset[idx]
+        image = sample["image"]
+        question = sample["question"]
+        qid = sample["question_id"]
+
+        raw_answer = sample.get("answer", "")
+        if isinstance(raw_answer, list):
+            answers = [str(a) for a in raw_answer]
+        elif isinstance(raw_answer, str):
+            try:
+                parsed = json.loads(raw_answer)
+                if isinstance(parsed, list):
+                    answers = [str(a) for a in parsed]
+                else:
+                    answers = [str(parsed)]
+            except (json.JSONDecodeError, ValueError):
+                answers = [raw_answer] if raw_answer else []
+        else:
+            answers = [str(raw_answer)]
+
+        category = sample.get("category", "unknown")
+
+        pred = generate_response(model, tokenizer, image, question, device)
+        correct = _ocrbench_match(answers, pred, category)
+
+        per_cat[category] = per_cat.get(category, 0) + int(correct)
+        per_cat_total[category] = per_cat_total.get(category, 0) + 1
+        if correct:
+            total_correct += 1
+
+        results.append({
+            "question_id": qid,
+            "question": question,
+            "prediction": pred,
+            "answer": answers,
+            "category": category,
+            "correct": correct,
+        })
+
+        if (idx + 1) % 100 == 0:
+            logger.info(
+                f"Progress: {idx+1}/{len(dataset)}, "
+                f"Score so far: {total_correct}/{idx+1}"
+            )
+
+    agg_scores = {}
+    for agg_name, sub_cats in OCRBENCH_AGG.items():
+        agg_scores[agg_name] = sum(per_cat.get(c, 0) for c in sub_cats)
+    agg_scores["Final Score"] = sum(agg_scores.values())
+    agg_scores["Final Score Norm"] = agg_scores["Final Score"] / 10.0
+
+    logger.info("=" * 60)
+    logger.info("OCRBench Results:")
+    for k, v in agg_scores.items():
+        logger.info(f"  {k}: {v}")
+    logger.info("=" * 60)
+
+    if output_path:
+        out = {
+            "scores": agg_scores,
+            "per_category": {c: {"correct": per_cat.get(c, 0),
+                                 "total": per_cat_total.get(c, 0)}
+                             for c in per_cat_total},
+            "results": results,
+        }
+        with open(output_path, "w") as f:
+            json.dump(out, f, indent=2)
+        logger.info(f"OCRBench results saved to {output_path}")
+
+    return agg_scores, results
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -427,6 +544,10 @@ def main(args):
             model, tokenizer, dataset, device, output_path, args.max_eval_samples or 50
         )
 
+    elif args.eval_mode == "ocrbench":
+        output_path = os.path.join(args.output_dir, f"ocrbench_results_{args.job_id}.json")
+        scores, results = evaluate_ocrbench(model, tokenizer, dataset, device, output_path)
+
     else:
         raise ValueError(f"Unknown eval mode: {args.eval_mode}")
 
@@ -455,8 +576,8 @@ if __name__ == "__main__":
 
     # Eval config
     parser.add_argument("--eval_mode", type=str, default="vqa",
-                        choices=["vqa", "generation"],
-                        help="Evaluation mode: vqa (accuracy) or generation (qualitative)")
+                        choices=["vqa", "generation", "ocrbench"],
+                        help="Evaluation mode: vqa | generation | ocrbench")
     parser.add_argument("--output_dir", type=str, default="eval_results",
                         help="Output directory for results")
 

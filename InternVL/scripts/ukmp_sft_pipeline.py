@@ -56,7 +56,7 @@ SFT_DATA_CONFIG = "configs/sft_data_config.json"
 SFT_SAMPLE_PERCENT = 40           # Use X% of SFT data (e.g. 40 for 40%, 100 for all)
 
 # --- Evaluation ---
-EVAL_MAX_SAMPLES = 50              # OCRBench samples to evaluate on
+EVAL_DATA_PATH = "configs/ocrbench_full.json"
 EVAL_IMAGE_ROOT = os.path.expanduser("~/LMUData/images/OCRBench")
 
 # ====================================================================
@@ -190,25 +190,8 @@ if MULTIMODAL:
 run(prune_cmd, "Pruning InternVL Model")
 
 # ====================================================================
-# Stage 2: Evaluate Pruned Model (OCRBench)
+# Stage 2: Evaluate Pruned Model (OCRBench — full 1000 samples)
 # ====================================================================
-EVAL_JSON_PATH = "configs/ocrbench_eval.json"
-
-if not os.path.exists(EVAL_JSON_PATH):
-    print(f"\n  Generating OCRBench eval JSON ({EVAL_MAX_SAMPLES} samples)...")
-    eval_items = []
-    images = sorted([f for f in os.listdir(EVAL_IMAGE_ROOT) if f.endswith(".png")])
-    for img_name in images[:EVAL_MAX_SAMPLES]:
-        eval_items.append({
-            "image": img_name,
-            "question": "What text is shown in this image?",
-            "answer": ""
-        })
-    os.makedirs(os.path.dirname(EVAL_JSON_PATH) or ".", exist_ok=True)
-    with open(EVAL_JSON_PATH, "w") as f:
-        json.dump(eval_items, f, indent=2)
-    print(f"  Saved {len(eval_items)} eval samples to {EVAL_JSON_PATH}")
-
 pruned_ckpt = f"{PRUNE_DIR}/pruned_model"
 if not os.path.isdir(pruned_ckpt):
     pruned_ckpt = f"{PRUNE_DIR}/pytorch_model.bin"
@@ -217,14 +200,13 @@ eval_pruned_cmd = (
     f"CUDA_VISIBLE_DEVICES={GPU} python -u evaluate_internvl_pruned.py"
     f" --model_name {MODEL_NAME}"
     f" --pruned_ckpt {pruned_ckpt}"
-    f" --eval_data_path {EVAL_JSON_PATH}"
+    f" --eval_data_path {EVAL_DATA_PATH}"
     f" --eval_image_root {EVAL_IMAGE_ROOT}"
-    f" --eval_mode generation"
-    f" --max_eval_samples {EVAL_MAX_SAMPLES}"
+    f" --eval_mode ocrbench"
     f" --job_id eval_pruned_{JOB_ID}"
     f" --output_dir eval_results/pruned_{JOB_ID}"
 )
-run(eval_pruned_cmd, "Evaluating Pruned Model on OCRBench")
+run(eval_pruned_cmd, "Evaluating Pruned Model on OCRBench (1000 samples)")
 
 # ====================================================================
 # Stage 3: Fine-tune (multi-GPU DDP)
@@ -275,14 +257,13 @@ eval_ft_cmd = (
     f"CUDA_VISIBLE_DEVICES={GPU} python -u evaluate_internvl_pruned.py"
     f" --model_name {MODEL_NAME}"
     f" --pruned_ckpt {FINETUNED_MODEL_DIR}"
-    f" --eval_data_path {EVAL_JSON_PATH}"
+    f" --eval_data_path {EVAL_DATA_PATH}"
     f" --eval_image_root {EVAL_IMAGE_ROOT}"
-    f" --eval_mode generation"
-    f" --max_eval_samples {EVAL_MAX_SAMPLES}"
+    f" --eval_mode ocrbench"
     f" --job_id eval_finetuned_{TUNE_JOB_ID}"
     f" --output_dir eval_results/finetuned_{TUNE_JOB_ID}"
 )
-run(eval_ft_cmd, "Evaluating Fine-tuned Model on OCRBench")
+run(eval_ft_cmd, "Evaluating Fine-tuned Model on OCRBench (1000 samples)")
 
 # ====================================================================
 # Summary
