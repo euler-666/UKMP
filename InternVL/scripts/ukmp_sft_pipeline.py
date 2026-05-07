@@ -28,11 +28,13 @@ GRANULARITY = "block"
 PRUNER_TYPE = "taylor+knowledge"
 TAYLOR_TYPE = "param_first"
 NUM_CALIB_EXAMPLES = 1000
-CHANNEL_PER_STEP = 200
+CHANNEL_PER_STEP = 250
 GLOBAL_PRUNING = True
 SELECT_LOSS = True
 ENTROPY_IMPORTANCE = True
 MULTIMODAL = True
+MULTIMODAL_PER_MODALITY_QUOTA = True   # Option B: independent per-modality quotas (size-proportional)
+IMP_NORMALIZER = "param"
 
 # --- Finetuning ---
 MAX_NUM_TILES = 6
@@ -65,11 +67,13 @@ EVAL_IMAGE_ROOT = os.path.expanduser("~/LMUData/images/OCRBench")
 global_str = "global" if GLOBAL_PRUNING else "local"
 select_loss_str = "-select_loss" if SELECT_LOSS else ""
 multimodal_str = "-multimodal" if MULTIMODAL else ""
+quota_str = "-quota" if (MULTIMODAL and MULTIMODAL_PER_MODALITY_QUOTA) else ""
+norm_str = IMP_NORMALIZER if IMP_NORMALIZER is not None else "no"
 
 JOB_ID = (
     f"internvl-{NUM_CALIB_EXAMPLES}data-{PRUNER_TYPE}-{TAYLOR_TYPE}-"
-    f"param_norm-{PRUNING_RATIO}-{GRANULARITY}wise-{global_str}"
-    f"{select_loss_str}{multimodal_str}"
+    f"{norm_str}_norm-{PRUNING_RATIO}-{GRANULARITY}wise-{global_str}"
+    f"{select_loss_str}{multimodal_str}{quota_str}"
 )
 
 PRUNE_DIR = f"pruned_checkpoint/ukmp_prune_internvl/{JOB_ID}"
@@ -180,12 +184,16 @@ prune_cmd = (
 )
 if GLOBAL_PRUNING:
     prune_cmd += " --global_pruning"
+if IMP_NORMALIZER is not None:
+    prune_cmd += f" --imp_normalizer {IMP_NORMALIZER}"
 if SELECT_LOSS:
     prune_cmd += " --select_loss"
 if ENTROPY_IMPORTANCE:
     prune_cmd += " --entropy_importance"
 if MULTIMODAL:
     prune_cmd += " --multimodal"
+if MULTIMODAL and MULTIMODAL_PER_MODALITY_QUOTA:
+    prune_cmd += " --multimodal_per_modality_quota"
 
 run(prune_cmd, "Pruning InternVL Model")
 

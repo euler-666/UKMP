@@ -237,7 +237,7 @@ class CalibrationDataset(Dataset):
     """
 
     def __init__(self, data_path, image_root, tokenizer, model, max_samples=1000,
-                 max_length=512, image_size=448):
+                 max_length=1024, image_size=448):
         with open(data_path, "r") as f:
             raw = json.load(f)
         self.data = raw[:max_samples]
@@ -367,7 +367,7 @@ def prepare_internvl_inputs(samples, model, tokenizer, device):
         )
 
         tokenized = tokenizer(full_prompt, return_tensors="pt", truncation=True,
-                              max_length=512, padding="max_length")
+                              max_length=1024, padding="max_length")
         input_ids = tokenized["input_ids"].squeeze(0)
 
         unpadded_ids = tokenizer(full_prompt, add_special_tokens=False, return_tensors="pt")["input_ids"].squeeze(0)
@@ -413,7 +413,7 @@ def prepare_internvl_inputs_simple(model, tokenizer, device, batch_size=1):
     question = f"{image_tokens}\nDescribe this image."
     full_prompt, _ = _build_prompt_from_template(model, question, "A photo.")
 
-    tokenized = tokenizer(full_prompt, return_tensors="pt", truncation=True, max_length=512)
+    tokenized = tokenizer(full_prompt, return_tensors="pt", truncation=True, max_length=1024)
     input_ids = tokenized["input_ids"].to(device)
     attention_mask = tokenized["attention_mask"].to(device)
     labels = input_ids.clone()
@@ -571,7 +571,15 @@ def main(args):
     if args.num_examples == 0:
         args.num_examples = len(data_loader)
 
-    if args.pruning_ratio <= 0.2:
+    # In non-quota mode the unified bottom-K threshold needs a smaller
+    # channel_per_step at low ratios to avoid overshooting the target.
+    # Option B uses per-modality parameter budgets, where a too-small
+    # channel_per_step makes the per-modality budget smaller than a
+    # single attention head and forces head pruning to be skipped --
+    # which then plateaus the modality whose MLP cap is below its
+    # parameter target (e.g. language at 20%). Keep the user-supplied
+    # channel_per_step in quota mode.
+    if args.pruning_ratio <= 0.2 and not getattr(args, "multimodal_per_modality_quota", False):
         args.channel_per_step = 100
 
     # ------------------------------------------------------------------
@@ -626,16 +634,20 @@ def main(args):
         # For GQA: use num_attention_heads (Q heads) as the grouping for Q proj
         num_heads[attn.q_proj] = attn.config.num_attention_heads
 
-    # q_norm and k_norm are per-head RMSNorms (shape=[head_dim]) that the
-    # dependency graph incorrectly links to the full hidden_dim axis of q_proj/k_proj.
-    # Pruning them with hidden_dim indices causes out-of-bounds errors.
+    # q_norm and k_norm are per-head RMSNorms (shape=[head_dim]) shared
+    # across all heads via broadcasting. Whole-head pruning of q_proj/k_proj
+    # leaves the per-head norm weights untouched. We tag them so that
+    # RMSNormMaskPruner no-ops on them, instead of putting them into
+    # ignored_layers (which would cause get_all_groups to silently drop
+    # the entire q_proj attention group, leaving 0 / 448 language heads
+    # ever prunable -- see dependency.py:535-544).
     ignored_layers = []
     for i in range(NUM_LLM_LAYERS):
         attn = model.language_model.model.layers[i].self_attn
         if hasattr(attn, 'q_norm'):
-            ignored_layers.append(attn.q_norm)
+            attn.q_norm._is_per_head_norm = True
         if hasattr(attn, 'k_norm'):
-            ignored_layers.append(attn.k_norm)
+            attn.k_norm._is_per_head_norm = True
 
     kwargs = {
         "importance": imp,
@@ -650,6 +662,7 @@ def main(args):
         "prune_num_heads": True,
         "prune_head_dims": False,
         "multimodal": args.multimodal,
+        "multimodal_per_modality_quota": args.multimodal_per_modality_quota,
         "root_instances": root_instances,
         "num_heads": num_heads,
     }
@@ -706,6 +719,9 @@ def main(args):
                         imp_list[i] = imp_list[i].view(ch_groups, -1).mean(1)
                     elif self.group_collect == "sum":
                         imp_list[i] = imp_list[i].view(ch_groups, -1).sum(1)
+            # Match the BLIP2/UKMP recipe (LAVIS/ukmp_prune.py:211-214):
+            # Taylor-only for vision groups, Taylor x Knowledge for ALL
+            # non-visual groups (both attention and FFN).
             if self.is_visual_part(group):
                 imp = imp_list[0]
             else:
@@ -813,9 +829,11 @@ def main(args):
         inputs = prepare_internvl_inputs(batch_samples, model, tokenizer, args.device)
         out = model(**inputs)
         loss = out.loss
-        if loss is not None:
+        if loss is not None and torch.isfinite(loss):
             logger.log(f"Batch {i} loss = {loss.item():.4f}")
             loss.backward()
+        else:
+            logger.log(f"Batch {i} loss = {loss}, SKIPPING backward (NaN/Inf)")
 
     # ------------------------------------------------------------------
     # 12. Run pruning
@@ -825,7 +843,7 @@ def main(args):
         iter_steps, pruned_ratio = 0, 0.0
         prev_params = before_pruning_parameters
         while pruned_ratio < args.pruning_ratio:
-            if pruned_ratio > 0.9 * args.pruning_ratio:
+            if pruned_ratio > 0.9 * args.pruning_ratio and not getattr(args, "multimodal_per_modality_quota", False):
                 pruner.channel_per_step = 100
             iter_steps += 1
             pruner.step()
@@ -1010,6 +1028,15 @@ if __name__ == "__main__":
                         help="Calibration batch size")
     parser.add_argument("--multimodal", action="store_true",
                         help="Normalize importance for multimodal pruning")
+    parser.add_argument("--multimodal_per_modality_quota", action="store_true",
+                        help="Option B: per-modality independent quotas. "
+                             "Each step's pruning budget is split between "
+                             "vision and language proportional to each "
+                             "modality's parameter size, with each modality "
+                             "applying its own threshold determined by its "
+                             "per-step parameter budget. Guarantees "
+                             "equal-percentage pruning per modality by "
+                             "construction.")
     parser.add_argument("--calib_data_path", type=str, required=True,
                         help="Path to calibration data JSON (e.g. CC595K annotations)")
     parser.add_argument("--calib_image_root", type=str, required=True,

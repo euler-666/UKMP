@@ -288,9 +288,20 @@ class T5LayerNormMaskPruner(BaseMaskPruningFunc):
     
 class RMSNormMaskPruner(BaseMaskPruningFunc):
     """Mask pruner for RMSNorm layers (e.g. Qwen3RMSNorm).
-    RMSNorm has a single weight vector (no bias), indexed along dim 0."""
+    RMSNorm has a single weight vector (no bias), indexed along dim 0.
+
+    Per-head norms (e.g. Qwen3 q_norm/k_norm with weight shape [head_dim])
+    are shared across all heads via broadcasting and must NOT be touched
+    when whole attention heads are pruned. Such modules can be tagged with
+    ``layer._is_per_head_norm = True`` to make every prune/compress
+    operation a no-op while still letting the dependency graph yield the
+    enclosing q_proj/k_proj group (instead of dropping it because the
+    norm sits in ``ignored_layers``).
+    """
 
     def prune_out_channels(self, layer: nn.Module, idxs: Sequence[int]) -> nn.Module:
+        if getattr(layer, "_is_per_head_norm", False):
+            return layer
         idxs.sort()
         self._prune_parameter_and_grad(layer.weight, idxs, 0)
         return layer
@@ -301,15 +312,21 @@ class RMSNormMaskPruner(BaseMaskPruningFunc):
         return layer.weight.size(0)
 
     def masked_get_out_channels(self, layer):
+        if getattr(layer, "_is_per_head_norm", False):
+            return layer.weight.size(0)
         return layer.weight.preserve_masks[0].sum()
 
     def get_in_channels(self, layer):
         return layer.weight.size(0)
 
     def masked_get_in_channels(self, layer):
+        if getattr(layer, "_is_per_head_norm", False):
+            return layer.weight.size(0)
         return layer.weight.preserve_masks[0].sum()
 
     def operate_out_masks(self, layer, mode):
+        if getattr(layer, "_is_per_head_norm", False):
+            return layer
         if mode == 'init':
             layer.weight.preserve_masks[0].fill_(1)
         elif mode == 'compress':
@@ -433,13 +450,21 @@ class TaylorImportance(tp.importance.Importance):
     def _normalize(self, group, group_imp):
         if self.normalizer == "param":
             params = []
+            norm_prune_fns = [
+                t5_layer_norm_mask_pruner.prune_out_channels,
+                t5_layer_norm_mask_pruner.prune_in_channels,
+                layer_norm_mask_pruner.prune_out_channels,
+                layer_norm_mask_pruner.prune_in_channels,
+                rms_norm_mask_pruner.prune_out_channels,
+                rms_norm_mask_pruner.prune_in_channels,
+            ]
             for dep, idxs in group:
                 idxs.sort()
                 layer = dep.target.module
                 prune_fn = dep.handler
                 # Linear out_channels
                 if prune_fn in [linear_mask_pruner.prune_out_channels]:
-                    if "qkv" in layer.weight.global_name: # TODO
+                    if "qkv" in layer.weight.global_name:
                         params.append(len(layer.weight.preserve_masks[1])*3)
                     else:
                         params.append(len(layer.weight.preserve_masks[1]))
@@ -448,7 +473,7 @@ class TaylorImportance(tp.importance.Importance):
                 elif prune_fn in [linear_mask_pruner.prune_in_channels]:
                     params.append(len(layer.weight.preserve_masks[0]))
 
-                elif prune_fn in [t5_layer_norm_mask_pruner.prune_out_channels, t5_layer_norm_mask_pruner.prune_in_channels]:
+                elif prune_fn in norm_prune_fns:
                     params.append(1)
 
             return group_imp / sum(params)
@@ -620,13 +645,21 @@ class KnowledgeImportance(tp.importance.Importance):
     
     def _normalize(self, group, group_imp):
         if self.normalizer == "param":
+            norm_prune_fns = [
+                t5_layer_norm_mask_pruner.prune_out_channels,
+                t5_layer_norm_mask_pruner.prune_in_channels,
+                layer_norm_mask_pruner.prune_out_channels,
+                layer_norm_mask_pruner.prune_in_channels,
+                rms_norm_mask_pruner.prune_out_channels,
+                rms_norm_mask_pruner.prune_in_channels,
+            ]
             params = []
             for dep, idxs in group:
                 layer = dep.target.module
                 prune_fn = dep.handler
                 # Linear out_channels
                 if prune_fn in [linear_mask_pruner.prune_out_channels]:
-                    if "qkv" in layer.weight.global_name: # TODO
+                    if "qkv" in layer.weight.global_name:
                         params.append(torch.sum(layer.weight.preserve_masks[1])*3)
                     else:
                         params.append(torch.sum(layer.weight.preserve_masks[1]))
@@ -635,7 +668,7 @@ class KnowledgeImportance(tp.importance.Importance):
                 elif prune_fn in [linear_mask_pruner.prune_in_channels]:
                     params.append(torch.sum(layer.weight.preserve_masks[0]))
 
-                elif prune_fn in [t5_layer_norm_mask_pruner.prune_out_channels, t5_layer_norm_mask_pruner.prune_in_channels]:
+                elif prune_fn in norm_prune_fns:
                     params.append(1)
             return group_imp / sum(params)
         elif self.normalizer is not None:

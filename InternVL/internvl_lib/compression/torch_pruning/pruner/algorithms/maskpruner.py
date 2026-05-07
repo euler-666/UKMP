@@ -64,6 +64,7 @@ class MaskPruner(MetaPruner):
         pre_imp: bool = False,
         imp_save_dir: str = None,
         multimodal_norm_type: str = "avg",
+        multimodal_per_modality_quota: bool = False,
     ):
         
         super(MaskPruner, self).__init__(
@@ -106,6 +107,13 @@ class MaskPruner(MetaPruner):
         self.mask_operation = mask_operation
         self.imp_save_dir = imp_save_dir
         self.multimodal_norm_type = multimodal_norm_type
+        # Option B: per-modality independent quotas. Each step's pruning
+        # budget is split between vision and language proportional to
+        # their parameter sizes, with each modality applying its own
+        # threshold determined by its per-step parameter budget. This
+        # gives equal-percentage pruning per modality by construction.
+        self.multimodal_per_modality_quota = multimodal_per_modality_quota
+        self._modality_total_params_cache = None
         
         # # build masks for pruning
         for name, param in model.named_parameters():
@@ -308,6 +316,164 @@ class MaskPruner(MetaPruner):
         imp[remain_channels==0] = float('inf')
         return imp, group_size
     
+    def _params_per_unit(self, group, num_units):
+        """Total Linear weight count in a group, divided by num_units.
+
+        For attention groups (post-head-collapse) this returns
+        params-per-head; for MLP/non-attn groups it returns
+        params-per-channel. Norm-only modules and Parameter ops are
+        skipped because they don't dominate the cost. ``num_units``
+        should be ``len(imp)`` after ``process_imp_list`` has done its
+        head collapse.
+        """
+        if num_units <= 0:
+            return 1.0
+        total = 0
+        seen = set()
+        for dep, _ in group:
+            m = dep.target.module
+            mid = id(m)
+            if mid in seen:
+                continue
+            seen.add(mid)
+            if isinstance(m, nn.Linear) and hasattr(m, "weight"):
+                total += m.weight.numel()
+        if total == 0:
+            return 1.0
+        return total / num_units
+
+    def _avg_cost_per_unit(self, *modality_lists):
+        """Average params-per-unit across all groups in the prunable pool.
+
+        Combines visual and language pools; weights by number of units per
+        group. Used to size the per-step total parameter budget for
+        Option B (per-modality independent quotas).
+        """
+        total_params, total_units = 0.0, 0
+        for items in modality_lists:
+            for group, _, _, _, imp in items:
+                n = imp.numel()
+                if n == 0:
+                    continue
+                ppu = self._params_per_unit(group, n)
+                total_params += ppu * n
+                total_units += n
+        if total_units == 0:
+            return 0.0
+        return total_params / total_units
+
+    def _greedy_select_by_budget(self, items, budget):
+        """Greedy-fit selection by imp ascending.
+
+        Walk all finite-imp units across ``items`` sorted by imp ascending.
+        Take each if its cost (``params_per_unit`` of its group) fits in the
+        remaining budget; otherwise skip it and continue with the next unit.
+
+        This handles the head-blocking case where the lowest-imp remaining
+        unit is an attention head whose cost (~262K-393K params) exceeds
+        the per-step modality budget alone (~115K-285K params). The strict
+        cumcost variant would return -inf in that case and stall the
+        modality; this greedy variant skips the head and keeps taking
+        cheaper MLP channels at slightly higher imp.
+
+        Returns a list parallel to ``items`` where each entry is a 1-D
+        LongTensor of selected unit indices (post-head-collapse, i.e.
+        head ids for attn groups, channel ids for MLP groups).
+        """
+        n_items = len(items)
+        empty = lambda: torch.zeros(0, dtype=torch.long)
+        selections = [empty() for _ in range(n_items)]
+        if budget <= 0 or n_items == 0:
+            return selections
+        flat_imps = []
+        flat_costs = []
+        flat_g_idx = []
+        flat_u_idx = []
+        for g_idx, item in enumerate(items):
+            group, _, _, _, imp = item
+            finite_mask = ~torch.isinf(imp)
+            if not bool(finite_mask.any()):
+                continue
+            ppu = self._params_per_unit(group, imp.numel())
+            finite_idxs = finite_mask.nonzero(as_tuple=True)[0]
+            flat_imps.append(imp[finite_idxs].detach())
+            flat_costs.append(torch.full_like(imp[finite_idxs], float(ppu)))
+            flat_g_idx.append(
+                torch.full((finite_idxs.numel(),), g_idx, dtype=torch.long, device=imp.device)
+            )
+            flat_u_idx.append(finite_idxs.to(torch.long))
+        if not flat_imps:
+            return selections
+        flat_imps = torch.cat(flat_imps).cpu()
+        flat_costs = torch.cat(flat_costs).cpu()
+        flat_g_idx = torch.cat(flat_g_idx).cpu()
+        flat_u_idx = torch.cat(flat_u_idx).cpu()
+        sorted_idx = torch.argsort(flat_imps)
+        sorted_costs = flat_costs[sorted_idx]
+        sorted_g = flat_g_idx[sorted_idx]
+        sorted_u = flat_u_idx[sorted_idx]
+        # Greedy fit (Python loop — pool size is bounded and this runs once
+        # per step; ~20ms for ~185K units in InternVL).
+        per_group_lists = [[] for _ in range(n_items)]
+        remaining = float(budget)
+        n = sorted_costs.numel()
+        sc = sorted_costs.tolist()
+        sg = sorted_g.tolist()
+        su = sorted_u.tolist()
+        for i in range(n):
+            ci = sc[i]
+            if ci <= remaining:
+                per_group_lists[sg[i]].append(su[i])
+                remaining -= ci
+        for g_idx in range(n_items):
+            if per_group_lists[g_idx]:
+                selections[g_idx] = torch.tensor(per_group_lists[g_idx], dtype=torch.long)
+        return selections
+
+    def _compute_modality_total_params(self):
+        """Sum total parameters per modality (visual vs language).
+
+        We classify by the ``vision`` / ``visual`` substring in the parameter
+        name (matching ``is_visual_part``); everything else (LLM, projector,
+        Q-Former, embeddings, ...) goes into the language bucket. Counts the
+        full model size, not just prunable channels -- this is the
+        denominator we want for "equal percentage pruned per modality".
+        Cached after the first call.
+        """
+        if self._modality_total_params_cache is not None:
+            return self._modality_total_params_cache
+        vis_total, lang_total = 0, 0
+        for name, p in self.DG.model.named_parameters():
+            n = p.numel()
+            if "vision" in name or "visual" in name:
+                vis_total += n
+            else:
+                lang_total += n
+        self._modality_total_params_cache = (vis_total, lang_total)
+        return self._modality_total_params_cache
+
+    def _compute_modality_remaining_params(self):
+        """Sum CURRENT remaining (unpruned) parameters per modality based on
+        the live ``preserve_masks`` state. Mirrors the per-iteration counter
+        used in ukmp_prune_internvl.py so the per-step budget matches the
+        ratio reported in the training log.
+        """
+        vis_remain, lang_remain = 0, 0
+        for name, p in self.DG.model.named_parameters():
+            if hasattr(p, "preserve_masks") and p.preserve_masks:
+                # Live param count = product of remaining size per dim.
+                kept = 1
+                for m in p.preserve_masks:
+                    kept *= int(m.sum().item())
+                n = kept
+            else:
+                n = p.numel()
+            if "vision" in name or "visual" in name:
+                vis_remain += n
+            else:
+                lang_remain += n
+        return vis_remain, lang_remain
+
     def prune_global_step_multimodal(self) -> typing.Generator:
         ##############################################
         # 1. Pre-compute importance for each group
@@ -370,58 +536,175 @@ class MaskPruner(MetaPruner):
         
         if self.multimodal_norm_type == 'avg':
             visual_avg, language_avg = torch.mean(concat_visual_imp), torch.mean(concat_language_imp)
+            visual_normed = []
+            language_normed = []
             for item in visual_global_importance:
                 *other_elements, last_tensor = item
-                global_importance.append((*other_elements, (last_tensor) / (visual_avg)))
+                visual_normed.append((*other_elements, (last_tensor) / (visual_avg)))
             for item in language_global_importance:
                 *other_elements, last_tensor = item
-                global_importance.append((*other_elements, (last_tensor) / (language_avg)))
+                language_normed.append((*other_elements, (last_tensor) / (language_avg)))
         elif self.multimodal_norm_type == 'minmax':
             visual_min, visual_max = torch.min(concat_visual_imp), torch.max(concat_visual_imp)
             language_min, language_max = torch.min(concat_language_imp), torch.max(concat_language_imp)
+            visual_normed = []
+            language_normed = []
             for item in visual_global_importance:
                 *other_elements, last_tensor = item
-                global_importance.append((*other_elements, (last_tensor - visual_min) / (visual_max - visual_min)))
+                visual_normed.append((*other_elements, (last_tensor - visual_min) / (visual_max - visual_min)))
             for item in language_global_importance:
                 *other_elements, last_tensor = item
-                global_importance.append((*other_elements, (last_tensor - language_min) / (language_max - language_min)))
-        else: 
+                language_normed.append((*other_elements, (last_tensor - language_min) / (language_max - language_min)))
+        else:
             raise NotImplementedError
-        
-        concat_imp = torch.cat([local_imp[-1] for local_imp in global_importance], dim=0)
-        topk_imp, _ = torch.topk(concat_imp, k=self.channel_per_step, largest=False)
-        thres = topk_imp[-1]
-        
+        global_importance = visual_normed + language_normed
+
+        # Decide per-group selections.
+        if self.multimodal_per_modality_quota:
+            # Option B: independent per-modality greedy-fit-by-param-budget.
+            # The per-step total parameter budget = channel_per_step *
+            # average per-unit cost across the prunable pool. We split
+            # that between modalities proportional to total modality size,
+            # so each modality removes the same percentage of its own
+            # parameters per step. Within each modality we greedy-fit
+            # units by imp ascending, skipping any unit whose individual
+            # cost exceeds the remaining budget (this prevents stalling
+            # when the lowest-imp finite unit is an attention head whose
+            # cost exceeds the per-step modality budget alone).
+            vis_total, lang_total = self._compute_modality_total_params()
+            grand_total = vis_total + lang_total
+            avg_cost = self._avg_cost_per_unit(visual_normed, language_normed)
+            step_total_budget = self.channel_per_step * avg_cost
+
+            # Drift-aware budget split. Compute each modality's CURRENT
+            # remaining params and the gap between its current pruned %
+            # and a single uniform target (= overall pruned % we want to be
+            # at after this step). The modality that is lagging gets a
+            # bigger share. This compensates for asymmetries that the
+            # static proportional split cannot fix on its own (e.g. GQA
+            # head-pruning being structurally hard for some layers, or
+            # different per-pick costs).
+            if grand_total > 0:
+                vis_remain, lang_remain = self._compute_modality_remaining_params()
+                grand_remain = vis_remain + lang_remain
+                vis_pruned_now = max(0, vis_total - vis_remain)
+                lang_pruned_now = max(0, lang_total - lang_remain)
+                grand_pruned_now = max(0, grand_total - grand_remain)
+                target_pct_after = (grand_pruned_now + step_total_budget) / grand_total
+                vis_pruned_target = target_pct_after * vis_total
+                lang_pruned_target = target_pct_after * lang_total
+                vis_gap = max(0.0, vis_pruned_target - vis_pruned_now)
+                lang_gap = max(0.0, lang_pruned_target - lang_pruned_now)
+                gap_total = vis_gap + lang_gap
+                if gap_total > 0:
+                    vis_step_budget = step_total_budget * (vis_gap / gap_total)
+                    lang_step_budget = step_total_budget * (lang_gap / gap_total)
+                else:
+                    vis_step_budget = step_total_budget * (vis_total / grand_total)
+                    lang_step_budget = step_total_budget * (lang_total / grand_total)
+            else:
+                vis_step_budget = lang_step_budget = 0.0
+                vis_remain = lang_remain = 0
+                vis_pruned_now = lang_pruned_now = 0
+            vis_selections = self._greedy_select_by_budget(visual_normed, vis_step_budget)
+            lang_selections = self._greedy_select_by_budget(language_normed, lang_step_budget)
+            # Periodic debug: print per-modality budget vs actual consumption.
+            self._quota_debug_step = getattr(self, "_quota_debug_step", -1) + 1
+            log_every = 25
+            if (self._quota_debug_step % log_every == 0) or self._quota_debug_step <= 2:
+                def _summarize(selections, items):
+                    n_picks = 0
+                    cost_used = 0.0
+                    n_attn_units_finite = 0
+                    n_attn_picks = 0
+                    n_mlp_units_finite = 0
+                    n_mlp_picks = 0
+                    n_groups_alive = 0
+                    for g_idx, (group, _, _, _, imp) in enumerate(items):
+                        finite_n = int((~torch.isinf(imp)).sum().item())
+                        if finite_n == 0:
+                            continue
+                        n_groups_alive += 1
+                        sel_n = int(selections[g_idx].numel())
+                        n_picks += sel_n
+                        ppu = self._params_per_unit(group, imp.numel())
+                        cost_used += float(ppu) * sel_n
+                        is_attn, _ = self._is_attn_group(group)
+                        if is_attn and self.prune_num_heads:
+                            n_attn_units_finite += finite_n
+                            n_attn_picks += sel_n
+                        else:
+                            n_mlp_units_finite += finite_n
+                            n_mlp_picks += sel_n
+                    return n_picks, cost_used, n_attn_picks, n_attn_units_finite, n_mlp_picks, n_mlp_units_finite, n_groups_alive
+
+                v_n, v_c, v_ap, v_af, v_mp, v_mf, v_g = _summarize(vis_selections, visual_normed)
+                l_n, l_c, l_ap, l_af, l_mp, l_mf, l_g = _summarize(lang_selections, language_normed)
+                vis_pct = 100.0 * vis_pruned_now / max(vis_total, 1)
+                lang_pct = 100.0 * lang_pruned_now / max(lang_total, 1)
+                msg = (
+                    f"[Option B step {self._quota_debug_step}] "
+                    f"avg_cost={avg_cost:.0f} step_tot={step_total_budget/1e3:.0f}K | "
+                    f"VIS pre={vis_pct:.2f}% budget={vis_step_budget/1e3:.0f}K "
+                    f"used={v_c/1e3:.0f}K ({100*v_c/max(vis_step_budget,1):.0f}%) "
+                    f"picks={v_n} (attn={v_ap}/{v_af} mlp={v_mp}/{v_mf}) grps={v_g} | "
+                    f"LANG pre={lang_pct:.2f}% budget={lang_step_budget/1e3:.0f}K "
+                    f"used={l_c/1e3:.0f}K ({100*l_c/max(lang_step_budget,1):.0f}%) "
+                    f"picks={l_n} (attn={l_ap}/{l_af} mlp={l_mp}/{l_mf}) grps={l_g}"
+                )
+                # Use the same logger as the rest of the pipeline so it ends up
+                # in training.log; print as a fallback in case logging is not
+                # configured.
+                try:
+                    import logging
+                    logging.getLogger().info(msg)
+                except Exception:
+                    pass
+                print(msg, flush=True)
+        else:
+            concat_imp = torch.cat([local_imp[-1] for local_imp in global_importance], dim=0)
+            topk_imp, _ = torch.topk(concat_imp, k=self.channel_per_step, largest=False)
+            shared_thres = topk_imp[-1]
+            vis_selections = [(imp <= shared_thres).nonzero().view(-1).cpu().to(torch.long)
+                              for (_, _, _, _, imp) in visual_normed]
+            lang_selections = [(imp <= shared_thres).nonzero().view(-1).cpu().to(torch.long)
+                               for (_, _, _, _, imp) in language_normed]
+
         ##############################################
         # 3. Prune
         ##############################################
-        for group, ch_groups, group_size, raw_imp, imp in global_importance:
-            module = group[0].dep.target.module
-            pruning_fn = group[0].dep.handler
-            get_channel_fn = self.DG.get_out_channels if self.DG.is_out_channel_pruning_fn(pruning_fn) else self.DG.get_in_channels
-            
-            pruning_indices = []
-            
-            ###################
-            _is_attn, qkv_layers = self._is_attn_group(group)
-            if _is_attn and self.prune_num_heads:
-                head_pruning_indices = (imp <= thres).nonzero().view(-1)
-                if len(head_pruning_indices)>0:
-                    for head_id in head_pruning_indices:
-                        pruning_indices.append( torch.arange(head_id*group_size, (head_id+1)*group_size, device=imp.device) )       
-            elif ch_groups > 1:
-                raise NotImplementedError
-            else:
-                _pruning_indices = (imp <= thres).nonzero().view(-1)
-                if len(_pruning_indices)>0:
-                    pruning_indices.append(_pruning_indices)
+        for is_vis, items, selections in (
+            (True, visual_normed, vis_selections),
+            (False, language_normed, lang_selections),
+        ):
+            for g_idx, (group, ch_groups, group_size, raw_imp, imp) in enumerate(items):
+                module = group[0].dep.target.module
+                pruning_fn = group[0].dep.handler
+                get_channel_fn = self.DG.get_out_channels if self.DG.is_out_channel_pruning_fn(pruning_fn) else self.DG.get_in_channels
 
-            if len(pruning_indices)==0: continue
-            pruning_indices = torch.unique(torch.cat(pruning_indices, 0)).tolist()
-            group = self.DG.get_pruning_group(
-                module, pruning_fn, pruning_indices)
-            yield group
-        del global_importance
+                sel = selections[g_idx]
+                if sel is None or sel.numel() == 0:
+                    continue
+
+                pruning_indices = []
+                _is_attn, qkv_layers = self._is_attn_group(group)
+                if _is_attn and self.prune_num_heads:
+                    for head_id in sel.tolist():
+                        pruning_indices.append(
+                            torch.arange(head_id * group_size, (head_id + 1) * group_size, device=imp.device)
+                        )
+                elif ch_groups > 1:
+                    raise NotImplementedError
+                else:
+                    pruning_indices.append(sel.to(imp.device))
+
+                if len(pruning_indices) == 0:
+                    continue
+                pruning_indices = torch.unique(torch.cat(pruning_indices, 0)).tolist()
+                group = self.DG.get_pruning_group(
+                    module, pruning_fn, pruning_indices)
+                yield group
+        del global_importance, visual_normed, language_normed
         
     def prune_local(self) -> typing.Generator:
         assert self.iterative_steps == 1
