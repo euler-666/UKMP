@@ -633,6 +633,32 @@ def main(args):
         attn = model.language_model.model.layers[i].self_attn
         # For GQA: use num_attention_heads (Q heads) as the grouping for Q proj
         num_heads[attn.q_proj] = attn.config.num_attention_heads
+        # If this layer uses GQA (n_q != n_kv), tag the q_proj with the
+        # info MaskPruner needs to (1) collapse Q heads to KV-group
+        # granularity for importance/budget accounting, and (2) bypass
+        # the dep graph auto-cascade (which uses identity i->i mapping
+        # and so prunes the wrong KV head). The MaskPruner detects GQA
+        # via the presence of these attrs on q_proj.
+        #
+        # IMPORTANT: We must use ``object.__setattr__`` for the module
+        # references (k_proj/v_proj/o_proj). nn.Module's ``__setattr__``
+        # auto-registers any nn.Module value as a submodule (placed into
+        # ``_modules``). If we let that happen, k/v/o_proj would become
+        # children of q_proj in the module tree, which makes the
+        # torch_pruning dep tracer cascade layer 0's q_proj across
+        # ALL 28 layers' attention modules via residual coupling --
+        # collapsing 28 separate attn groups into a single 3000+ dep
+        # supergroup. Bypassing ``__setattr__`` keeps the module tree
+        # unchanged; we just stash the references on ``q_proj.__dict__``.
+        n_q = attn.config.num_attention_heads
+        n_kv = getattr(attn.config, "num_key_value_heads", n_q)
+        if n_kv != n_q:
+            attn.q_proj._gqa_n_q_heads = n_q
+            attn.q_proj._gqa_n_kv_heads = n_kv
+            attn.q_proj._gqa_head_dim = attn.q_proj.out_features // n_q
+            object.__setattr__(attn.q_proj, "_gqa_k_proj", attn.k_proj)
+            object.__setattr__(attn.q_proj, "_gqa_v_proj", attn.v_proj)
+            object.__setattr__(attn.q_proj, "_gqa_o_proj", attn.o_proj)
 
     # q_norm and k_norm are per-head RMSNorms (shape=[head_dim]) shared
     # across all heads via broadcasting. Whole-head pruning of q_proj/k_proj

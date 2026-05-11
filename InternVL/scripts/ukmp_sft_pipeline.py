@@ -22,7 +22,7 @@ NGPU = 4                           # GPUs for finetuning (DDP)
 MODEL_NAME = "OpenGVLab/InternVL3_5-1B"
 
 # --- Pruning ---
-PRUNING_RATIO = 0.05
+PRUNING_RATIO = 0.2
 MAX_PRUNING_RATIO = 0.5
 GRANULARITY = "block"
 PRUNER_TYPE = "taylor+knowledge"
@@ -33,7 +33,7 @@ GLOBAL_PRUNING = True
 SELECT_LOSS = True
 ENTROPY_IMPORTANCE = True
 MULTIMODAL = True
-MULTIMODAL_PER_MODALITY_QUOTA = True   # Option B: independent per-modality quotas (size-proportional)
+MULTIMODAL_PER_MODALITY_QUOTA = False  # Option B: independent per-modality quotas (size-proportional)
 IMP_NORMALIZER = "param"
 
 # --- Finetuning ---
@@ -55,7 +55,7 @@ LOG_INTERVAL = 100
 
 # --- Data paths ---
 SFT_DATA_CONFIG = "configs/sft_data_config.json"
-SFT_SAMPLE_PERCENT = 40           # Use X% of SFT data (e.g. 40 for 40%, 100 for all)
+SFT_SAMPLE_PERCENT = 100           # Use X% of SFT data (e.g. 40 for 40%, 100 for all)
 
 # --- Evaluation ---
 EVAL_DATA_PATH = "configs/ocrbench_full.json"

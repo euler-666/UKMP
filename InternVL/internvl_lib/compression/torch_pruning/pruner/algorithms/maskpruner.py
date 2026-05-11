@@ -474,6 +474,122 @@ class MaskPruner(MetaPruner):
                 lang_remain += n
         return vis_remain, lang_remain
 
+    # ------------------------------------------------------------------
+    # GQA-aware head pruning
+    # ------------------------------------------------------------------
+    # The torch_pruning dep graph was designed for vanilla MHA where Q, K
+    # and V all have the same number of heads. For GQA (e.g. Qwen3 with
+    # 16 Q heads / 8 KV heads) the auto-cascade does the wrong thing:
+    # pruning a Q head's channels [h*hd:(h+1)*hd] cascades to k_proj.out
+    # and v_proj.out using identity index mapping, which lands on the
+    # wrong KV head (Q head 7 should share KV head 7 // ratio = 3, not
+    # KV head 7).
+    #
+    # We work around this by:
+    #   1) treating each KV head + its `ratio` Q heads as one prunable
+    #      "GQA group" (so importance/budget collapse to KV-head
+    #      granularity), and
+    #   2) bypassing the auto-cascade for GQA picks and manually building
+    #      a Group with the correct (q_idxs, kv_idxs) pairs.
+    #
+    # GQA layers must be tagged in the pre-processing step (see
+    # ukmp_prune_internvl.py) by setting these attributes on q_proj:
+    #   - q_proj._gqa_n_q_heads, _gqa_n_kv_heads, _gqa_head_dim
+    #   - q_proj._gqa_k_proj, _gqa_v_proj, _gqa_o_proj
+    def _get_gqa_dims(self, group):
+        """Return a dict with GQA dims if this attention group is GQA,
+        otherwise None. The check is a single attribute lookup on q_proj
+        (see ``ukmp_prune_internvl.py`` for where these are tagged).
+        """
+        for dep, _ in group:
+            m = dep.target.module
+            if hasattr(m, "_gqa_n_kv_heads") and isinstance(m, nn.Linear):
+                return {
+                    "n_q": m._gqa_n_q_heads,
+                    "n_kv": m._gqa_n_kv_heads,
+                    "head_dim": m._gqa_head_dim,
+                    "ratio": m._gqa_n_q_heads // m._gqa_n_kv_heads,
+                    "q_proj": m,
+                    "k_proj": m._gqa_k_proj,
+                    "v_proj": m._gqa_v_proj,
+                    "o_proj": m._gqa_o_proj,
+                }
+        return None
+
+    def _get_channel_groups(self, group) -> int:
+        """Override base ``_get_channel_groups`` to collapse Q heads down
+        to KV-group granularity for GQA layers. Each prunable "head" then
+        represents one KV head plus its ``ratio`` shared Q heads.
+        """
+        ch_groups = super()._get_channel_groups(group)
+        gqa = self._get_gqa_dims(group)
+        if gqa is not None and self.prune_num_heads:
+            ch_groups = gqa["n_kv"]
+        return ch_groups
+
+    def _build_gqa_pruning_group(self, gqa, kv_group_ids):
+        """Manually construct a ``Group`` that prunes ``ratio`` Q heads
+        plus 1 KV head for each entry in ``kv_group_ids``. We bypass the
+        dep graph auto-cascade because it uses identity i->i index
+        mapping for q_proj.out -> k_proj.out, which is wrong under GQA.
+        Caller still goes through ``Group.prune()`` which iterates the
+        explicit (dep, idxs) pairs and calls each handler directly.
+        """
+        from ...dependency import Dependency, Group
+        from ..._helpers import _HybridIndex
+
+        ratio = gqa["ratio"]
+        hd = gqa["head_dim"]
+        q_proj = gqa["q_proj"]
+        k_proj = gqa["k_proj"]
+        v_proj = gqa["v_proj"]
+        o_proj = gqa["o_proj"]
+
+        q_idxs, kv_idxs = [], []
+        for kv_id in kv_group_ids:
+            q_idxs.extend(range(kv_id * ratio * hd, (kv_id + 1) * ratio * hd))
+            kv_idxs.extend(range(kv_id * hd, (kv_id + 1) * hd))
+        q_idxs.sort()
+        kv_idxs.sort()
+
+        # Resolve the LinearMaskPruner instance from the registered pruners
+        # so we use the bound mask-version handlers (not the in-place
+        # compression versions of LinearPruner).
+        pruner_inst = self.DG.get_pruner_of_module(q_proj)
+        fn_out = pruner_inst.prune_out_channels
+        fn_in = pruner_inst.prune_in_channels
+
+        q_node = self.DG.module2node[q_proj]
+        k_node = self.DG.module2node[k_proj]
+        v_node = self.DG.module2node[v_proj]
+        o_node = self.DG.module2node[o_proj]
+
+        q_idxs_h = [_HybridIndex(idx=i, root_idx=i) for i in q_idxs]
+        kv_idxs_h = [_HybridIndex(idx=i, root_idx=i) for i in kv_idxs]
+
+        group = Group()
+        group._DG = self.DG
+        # Order matters only for record_history (group[0] is treated as
+        # the root op). Put q_proj first so the history reflects the Q
+        # head that was the importance-driving root.
+        group.add_dep(
+            dep=Dependency(fn_out, fn_out, source=q_node, target=q_node),
+            idxs=q_idxs_h,
+        )
+        group.add_dep(
+            dep=Dependency(fn_out, fn_out, source=k_node, target=k_node),
+            idxs=kv_idxs_h,
+        )
+        group.add_dep(
+            dep=Dependency(fn_out, fn_out, source=v_node, target=v_node),
+            idxs=kv_idxs_h,
+        )
+        group.add_dep(
+            dep=Dependency(fn_in, fn_in, source=o_node, target=o_node),
+            idxs=q_idxs_h,
+        )
+        return group
+
     def prune_global_step_multimodal(self) -> typing.Generator:
         ##############################################
         # 1. Pre-compute importance for each group
@@ -520,12 +636,54 @@ class MaskPruner(MetaPruner):
                     if _is_attn and self.prune_num_heads:
                         remain_channels = remain_channels.view(ch_groups, -1)[:,0].view(-1)
                     imp[remain_channels==0] = float('inf')
-                    
+
                 if self.is_visual_part(group):  
                     visual_global_importance.append((group, ch_groups, group_size, raw_imp, imp))
                 else:
                     language_global_importance.append((group, ch_groups, group_size, raw_imp, imp))
-        
+
+        # First-step group inventory: dump every group with its root, ch_groups,
+        # imp shape and a few key cascade members. This makes it obvious if 27
+        # of the lang attention layers' q_proj groups are being collapsed into
+        # a single cross-layer cascade, or simply not yielded by get_all_groups.
+        if not getattr(self, "_quota_dumped_inventory", False):
+            self._quota_dumped_inventory = True
+            try:
+                import logging
+                logger = logging.getLogger()
+                logger.info(
+                    "[Option B inventory] visual=%d language=%d",
+                    len(visual_global_importance), len(language_global_importance),
+                )
+                for tag, items in (("VIS", visual_global_importance), ("LANG", language_global_importance)):
+                    for gi, (group, _ch_groups, _gs, _ri, _imp) in enumerate(items):
+                        try:
+                            root_mod = group[0].dep.target.module
+                            root_name = getattr(getattr(root_mod, "weight", None), "global_name", None)
+                            if root_name is None:
+                                root_name = root_mod.__class__.__name__
+                            members = []
+                            for d, _ in group:
+                                m = d.target.module
+                                gn = getattr(getattr(m, "weight", None), "global_name", None)
+                                if gn is None:
+                                    gn = m.__class__.__name__
+                                members.append(gn)
+                            is_attn, _ = self._is_attn_group(group)
+                            finite_n = int((~torch.isinf(_imp)).sum().item())
+                            n_inf = int(torch.isinf(_imp).sum().item())
+                            n_nan = int(torch.isnan(_imp).sum().item())
+                            logger.info(
+                                "[%s g%d] root=%s ch=%d imp_shape=%s finite=%d inf=%d nan=%d is_attn=%s ndep=%d members=%s",
+                                tag, gi, root_name, _ch_groups, tuple(_imp.shape),
+                                finite_n, n_inf, n_nan, is_attn, len(members),
+                                members[:6] + (["..."] if len(members) > 6 else []),
+                            )
+                        except Exception as e:
+                            logger.info("[%s g%d] dump error: %s", tag, gi, e)
+            except Exception:
+                pass
+
         ##############################################
         # 2. Thresholding by concatenating all importance scores
         ##############################################
@@ -686,8 +844,19 @@ class MaskPruner(MetaPruner):
                 if sel is None or sel.numel() == 0:
                     continue
 
-                pruning_indices = []
                 _is_attn, qkv_layers = self._is_attn_group(group)
+                gqa = self._get_gqa_dims(group) if _is_attn and self.prune_num_heads else None
+
+                # GQA path: bypass the dep-graph auto-cascade (which uses
+                # identity i->i index mapping for q_proj.out -> k_proj.out
+                # and would prune the wrong KV head). Build a Group
+                # explicitly with q_idxs for q_proj/o_proj and the
+                # ratio-mapped kv_idxs for k_proj/v_proj.
+                if gqa is not None:
+                    yield self._build_gqa_pruning_group(gqa, sel.tolist())
+                    continue
+
+                pruning_indices = []
                 if _is_attn and self.prune_num_heads:
                     for head_id in sel.tolist():
                         pruning_indices.append(
